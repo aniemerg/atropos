@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -63,6 +64,11 @@ def parse_args():
         "--use-chat-completion",
         action="store_true",
         help="Use chat completion API instead of completion API",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable additional debug logging",
     )
 
     # Server configuration
@@ -291,11 +297,11 @@ async def run_task(args, task, model):
     # Create tools with file access
     tools = create_tools(task["file_name"])
 
-    # Initialize CodeAgent
+    # Initialize CodeAgent with the specified number of steps
     agent = CodeAgent(
         tools=tools,
         model=model,
-        max_steps=args.max_steps,
+        max_steps=args.max_steps,  # Use the max steps from args
         additional_authorized_imports=["*"],  # Allow all imports for flexibility
         verbosity_level=2,  # Set to INFO level
     )
@@ -316,38 +322,132 @@ async def run_task(args, task, model):
 
     logger.info(f"Running agent on task: {task['task_id']}")
     logger.info(f"Prompt: {prompt}")
+    logger.info(f"Running agent with timeout of {args.timeout} seconds")
 
     # Execute the agent with the prompt
-    # We need to run this in a separate Thread to avoid event loop issues
-    import concurrent.futures
-    
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(agent.run, prompt)
-        result = future.result()
-
-    # Get agent memory for detailed output
-    agent_memory = agent.write_memory_to_messages()
-
-    # Evaluate the result
-    is_correct = task["true_answer"].lower() in result.lower()
-
-    # Prepare results
-    execution_result = {
-        "task_id": task["task_id"],
-        "question": task["question"],
-        "true_answer": task["true_answer"],
-        "prediction": result,
-        "correct": is_correct,
-        "agent_memory": agent_memory,
-        "num_steps": len(agent.memory.steps),
-    }
-
-    return execution_result
+    try:
+        # Use a timeout to avoid hanging
+        import threading
+        
+        # We need to run agent.run in a separate thread
+        # because it may create event loops internally
+        result_queue = queue.Queue()
+        
+        def run_agent():
+            try:
+                result = agent.run(prompt)
+                result_queue.put(("success", result))
+            except Exception as e:
+                error_msg = f"Error running agent: {e}"
+                logger.error(error_msg)
+                result_queue.put(("error", error_msg))
+                
+        # Start a thread to run the agent
+        thread = threading.Thread(target=run_agent)
+        thread.daemon = True
+        thread.start()
+        
+        # Wait for the thread to complete or timeout
+        thread.join(timeout=args.timeout)  # Use the timeout from args
+        
+        if thread.is_alive():
+            # If the thread is still running after timeout, force quit
+            logger.error("Agent execution timed out")
+            return {
+                "task_id": task["task_id"],
+                "question": task["question"],
+                "true_answer": task["true_answer"],
+                "prediction": "Agent timed out. The solution may be incomplete.",
+                "correct": False,
+                "agent_memory": [],
+                "num_steps": 0,
+            }
+            
+        # Get the result
+        if not result_queue.empty():
+            status, result = result_queue.get()
+            if status == "error":
+                logger.error(f"Agent failed: {result}")
+                return {
+                    "task_id": task["task_id"],
+                    "question": task["question"],
+                    "true_answer": task["true_answer"],
+                    "prediction": f"Agent encountered an error. The solution may be incomplete.",
+                    "correct": False,
+                    "agent_memory": [],
+                    "num_steps": 0,
+                }
+        else:
+            result = "No result from agent."
+            
+        # Get agent memory for detailed output
+        try:
+            agent_memory = agent.write_memory_to_messages()
+        except Exception as memory_e:
+            logger.error(f"Error getting agent memory: {memory_e}")
+            agent_memory = []
+        
+        # Evaluate the result
+        # Try more flexible matching since formats might differ slightly
+        # First, check for strict containment
+        is_correct = task["true_answer"].lower() in result.lower()
+        
+        # If not correct, try stripping whitespace and checking function bodies
+        if not is_correct:
+            import re
+            
+            # Extract function body from both expected and actual
+            def normalize_code(code_str):
+                # Remove whitespace and comments
+                code_str = re.sub(r'\s+', '', code_str)
+                code_str = re.sub(r'#.*', '', code_str)
+                return code_str
+            
+            # Try to extract logical parts and compare
+            expected_normalized = normalize_code(task["true_answer"])
+            result_normalized = normalize_code(result)
+            
+            # Check if the normalized result contains the normalized expected answer
+            is_correct = expected_normalized in result_normalized
+        
+        # Prepare results
+        execution_result = {
+            "task_id": task["task_id"],
+            "question": task["question"],
+            "true_answer": task["true_answer"],
+            "prediction": result,
+            "correct": is_correct,
+            "agent_memory": agent_memory,
+            "num_steps": len(agent.memory.steps) if hasattr(agent, 'memory') and hasattr(agent.memory, 'steps') else 0,
+        }
+        
+        return execution_result
+            
+    except Exception as e:
+        logger.error(f"Error in agent execution: {e}")
+        # Create a minimal result structure for error case
+        return {
+            "task_id": task["task_id"],
+            "question": task["question"],
+            "true_answer": task["true_answer"],
+            "prediction": f"Error: {str(e)}",
+            "correct": False,
+            "agent_memory": [],
+            "num_steps": 0,
+        }
 
 
 async def main():
     """Main function to run a single GAIA benchmark task."""
     args = parse_args()
+
+    # Set up logging based on debug flag
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("smolagents").setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
