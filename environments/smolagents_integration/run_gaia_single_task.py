@@ -14,17 +14,19 @@ import logging
 import os
 import zipfile
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+from smolagents import CodeAgent, LiteLLMModel
+from smolagents.tools import Tool, tool
 
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig
-from environments.smolagents_integration.atropos_smolagents_integration import AtroposServerModel
-
-from smolagents import CodeAgent, Tool, LiteLLMModel
+from environments.smolagents_integration.atropos_smolagents_integration import (
+    AtroposServerModel,
+)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -32,37 +34,73 @@ logger = logging.getLogger(__name__)
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run a single GAIA benchmark task")
-    
+
     # Task selection
-    parser.add_argument("--dataset-path", type=str, default="data/gaia",
-                        help="Path to the GAIA benchmark data")
-    parser.add_argument("--split", type=str, default="validation",
-                        help="Dataset split to use (validation, test)")
-    parser.add_argument("--task-id", type=str, required=True,
-                        help="ID of the task to run")
-    
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="data/gaia",
+        help="Path to the GAIA benchmark data",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="validation",
+        help="Dataset split to use (validation, test)",
+    )
+    parser.add_argument(
+        "--task-id", type=str, required=True, help="ID of the task to run"
+    )
+
     # Agent configuration
-    parser.add_argument("--max-steps", type=int, default=12,
-                        help="Maximum number of steps for the agent")
-    parser.add_argument("--use-chat-completion", action="store_true",
-                        help="Use chat completion API instead of completion API")
-    
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=12,
+        help="Maximum number of steps for the agent",
+    )
+    parser.add_argument(
+        "--use-chat-completion",
+        action="store_true",
+        help="Use chat completion API instead of completion API",
+    )
+
     # Server configuration
-    parser.add_argument("--api-key", type=str, default="x",
-                        help="API key for OpenAI API. Use 'x' for local servers.")
-    parser.add_argument("--base-url", type=str, default="http://localhost:8000/v1",
-                        help="URL of the API endpoint")
-    parser.add_argument("--model-name", type=str, default="gpt-3.5-turbo",
-                        help="Model name to use")
-    parser.add_argument("--timeout", type=int, default=120,
-                        help="Timeout for server requests in seconds")
-    
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=os.environ.get("OPENAI_API_KEY", "x"),
+        help="API key for OpenAI API. Use 'x' for local servers.",
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default="http://localhost:8000/v1",
+        help="URL of the API endpoint",
+    )
+    parser.add_argument(
+        "--model-name", type=str, default="gpt-3.5-turbo", help="Model name to use"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Timeout for server requests in seconds",
+    )
+
     # Output
-    parser.add_argument("--output-dir", type=str, default="gaia_results",
-                        help="Directory to store results")
-    parser.add_argument("--use-local-model", action="store_true",
-                        help="Use LiteLLM instead of Atropos for testing purposes")
-    
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="gaia_results",
+        help="Directory to store results",
+    )
+    parser.add_argument(
+        "--use-local-model",
+        action="store_true",
+        help="Use LiteLLM instead of Atropos for testing purposes",
+    )
+
     return parser.parse_args()
 
 
@@ -83,13 +121,22 @@ def load_task(dataset_path: str, split: str, task_id: str) -> Dict[str, Any]:
     """Load a specific task from the GAIA dataset."""
     try:
         import datasets
-        
-        dataset = datasets.load_dataset(
-            f"{dataset_path}/GAIA.py",
-            name="2023_all",
-            split=split,
-        )
-        
+
+        # Try direct HuggingFace loading if local fails
+        try:
+            dataset = datasets.load_dataset(
+                f"{dataset_path}/GAIA.py",
+                name="2023_all",
+                split=split,
+            )
+        except FileNotFoundError:
+            # Fall back to loading directly from HuggingFace
+            logger.info(f"Local dataset not found, loading directly from HuggingFace...")
+            dataset = datasets.load_dataset(
+                "neulab/gaia-dataset",
+                split=split,
+            )
+
         # Find the task by ID
         for example in dataset:
             if example.get("task_id", "") == task_id:
@@ -98,14 +145,17 @@ def load_task(dataset_path: str, split: str, task_id: str) -> Dict[str, Any]:
                     "true_answer": example["Final answer"],
                     "task": example["Level"],
                     "task_id": task_id,
-                    "file_name": f"{dataset_path}/{split}/{example['file_name']}" 
-                        if example["file_name"] else ""
+                    "file_name": (
+                        f"{dataset_path}/{split}/{example['file_name']}"
+                        if example["file_name"]
+                        else ""
+                    ),
                 }
                 return task
-        
+
         # If task not found
         raise ValueError(f"Task ID {task_id} not found in the {split} split")
-        
+
     except Exception as e:
         logger.error(f"Error loading GAIA task: {e}")
         raise
@@ -113,16 +163,21 @@ def load_task(dataset_path: str, split: str, task_id: str) -> Dict[str, Any]:
 
 def create_tools(file_path: Optional[str] = None) -> List[Tool]:
     """Create tools for the CodeAgent, including file access tools."""
-    
+
     tools = []
-    
-    # Add the python execution tool
-    def execute_python(code: str) -> str:
-        """Execute Python code safely."""
+
+    # Create Python execution tool using decorator
+    @tool
+    def python(code: str) -> str:
+        """Execute Python code safely.
+        
+        Args:
+            code: Python code to execute
+        """
         try:
             # Create a namespace for execution
             namespace = {}
-            
+
             # Add file contents to namespace if available
             if file_path:
                 if file_path.endswith(".zip"):
@@ -133,37 +188,37 @@ def create_tools(file_path: Optional[str] = None) -> List[Tool]:
                             namespace["file_contents"] = f.read()
                     except Exception as e:
                         return f"Error reading file: {str(e)}"
-            
+
             # Execute the code in the namespace
             exec(code, namespace)
-            
+
             # Check for a result variable
             if "result" in namespace:
                 return str(namespace["result"])
-            
+
             # Otherwise return success
             return "Code executed successfully (no result variable found)"
         except Exception as e:
             return f"Error executing code: {str(e)}"
-    
-    tools.append(Tool(
-        name="python",
-        description="Execute Python code safely",
-        inputs={"code": {"type": "string", "description": "Python code to execute"}},
-        function=execute_python
-    ))
-    
-    # Add file reader tool
-    def read_file(path: Optional[str] = None) -> str:
-        """Read contents of a file."""
+
+    tools.append(python)
+
+    # Create file reader tool using decorator
+    @tool
+    def file_reader(path: Optional[str] = None) -> str:
+        """Read contents of a file.
+        
+        Args:
+            path: Path to file (optional)
+        """
         try:
             # If no path specified but we have a file from the task, use that
             if not path and file_path:
                 path = file_path
-            
+
             if not path:
                 return "No file path specified"
-            
+
             # Handle zip files
             if path.endswith(".zip"):
                 contents = get_zip_contents(path)
@@ -174,28 +229,24 @@ def create_tools(file_path: Optional[str] = None) -> List[Tool]:
                     + "\n\nUse the python tool to access specific files by using "
                     + "the zip_contents dictionary."
                 )
-            
+
             # Regular file
             with open(path, "r") as f:
                 return f.read()
         except Exception as e:
             return f"Error reading file at {path}: {str(e)}"
-    
-    tools.append(Tool(
-        name="file_reader",
-        description="Read contents of a file",
-        inputs={"path": {"type": "string", "description": "Path to file (optional)"}},
-        function=read_file
-    ))
-    
+
+    tools.append(file_reader)
+
     return tools
 
 
 async def create_atropos_model(args):
     """Create an AtroposServerModel instance."""
     import asyncio
+
     from atroposlib.envs.server_handling.openai_server import OpenAIServer
-    
+
     # Create server configuration
     server_config = OpenaiConfig(
         api_key=args.api_key,
@@ -203,26 +254,35 @@ async def create_atropos_model(args):
         model_name=args.model_name,
         timeout=args.timeout,
     )
-    
+
     # Create server
     server = OpenAIServer(server_config)
-    
+
     # Create model
     model = AtroposServerModel(
         server=server,
         use_chat_completion=args.use_chat_completion,
         model_id=f"atropos-{args.model_name}",
     )
-    
+
     return model
 
 
 def create_test_model(args):
     """Create a LiteLLM model for testing without Atropos."""
+    # Ensure we have a valid API key
+    api_key = args.api_key
+    if api_key == "x" or not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("No OpenAI API key provided. Set OPENAI_API_KEY environment variable or use --api-key")
+    
     return LiteLLMModel(
         model_id=args.model_name,
-        api_key=args.api_key if args.api_key != "x" else None,
-        api_base=args.base_url if not args.base_url.endswith("/v1") else args.base_url[:-3]
+        api_key=api_key,
+        api_base=(
+            args.base_url if not args.base_url.endswith("/v1") else args.base_url[:-3]
+        ),
     )
 
 
@@ -230,7 +290,7 @@ async def run_task(args, task, model):
     """Run the GAIA benchmark task with the provided model."""
     # Create tools with file access
     tools = create_tools(task["file_name"])
-    
+
     # Initialize CodeAgent
     agent = CodeAgent(
         tools=tools,
@@ -239,31 +299,38 @@ async def run_task(args, task, model):
         additional_authorized_imports=["*"],  # Allow all imports for flexibility
         verbosity_level=2,  # Set to INFO level
     )
-    
+
     # Construct the prompt
     prompt = task["question"]
-    
+
     # Add file information if available
     if task["file_name"]:
         if task["file_name"].endswith(".zip"):
             prompt += f"\n\nTo solve this task, you can use the zip file at: {task['file_name']}"
             prompt += "\nYou can access the files in the zip using the 'file_reader' tool or directly in Python using the 'zip_contents' dictionary."
         else:
-            prompt += f"\n\nTo solve this task, you can use the file at: {task['file_name']}"
+            prompt += (
+                f"\n\nTo solve this task, you can use the file at: {task['file_name']}"
+            )
             prompt += "\nYou can read this file using the 'file_reader' tool or access it in Python as 'file_contents'."
-    
+
     logger.info(f"Running agent on task: {task['task_id']}")
     logger.info(f"Prompt: {prompt}")
-    
+
     # Execute the agent with the prompt
-    result = agent.run(prompt)
+    # We need to run this in a separate Thread to avoid event loop issues
+    import concurrent.futures
     
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(agent.run, prompt)
+        result = future.result()
+
     # Get agent memory for detailed output
     agent_memory = agent.write_memory_to_messages()
-    
+
     # Evaluate the result
     is_correct = task["true_answer"].lower() in result.lower()
-    
+
     # Prepare results
     execution_result = {
         "task_id": task["task_id"],
@@ -272,38 +339,45 @@ async def run_task(args, task, model):
         "prediction": result,
         "correct": is_correct,
         "agent_memory": agent_memory,
-        "num_steps": len(agent.memory.steps)
+        "num_steps": len(agent.memory.steps),
     }
-    
+
     return execution_result
 
 
 async def main():
     """Main function to run a single GAIA benchmark task."""
     args = parse_args()
-    
+
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Enable chat completion for chat-only models like GPT-4o
+    if args.model_name.startswith(("gpt-4", "gpt-3.5-turbo", "claude", "gemini")):
+        logger.info(f"Automatically enabling chat completion for {args.model_name}")
+        args.use_chat_completion = True
+
     # Load the task
     task = load_task(args.dataset_path, args.split, args.task_id)
-    
+
     # Create the model
     if args.use_local_model:
         model = create_test_model(args)
     else:
         model = await create_atropos_model(args)
-    
+
     # Run the task
     result = await run_task(args, task, model)
-    
+
     # Save the result
     output_path = os.path.join(args.output_dir, f"{args.task_id}_result.json")
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
-    
+
     # Print the result
-    logger.info(f"Task completed: {'✓ Correct' if result['correct'] else '✗ Incorrect'}")
+    logger.info(
+        f"Task completed: {'✓ Correct' if result['correct'] else '✗ Incorrect'}"
+    )
     logger.info(f"Expected: {task['true_answer']}")
     logger.info(f"Actual: {result['prediction']}")
     logger.info(f"Results saved to: {output_path}")
