@@ -23,6 +23,12 @@ from atroposlib.envs.server_handling.server_manager import ServerManager
 from smolagents import CodeAgent, tool
 from smolagents.default_tools import PythonInterpreterTool, FinalAnswerTool
 
+# Import our patched AsyncBridge and apply the patch
+from environments.smolagents_integration.patched_async_bridge import patch_asyncbridge
+# Patch AsyncBridge with our enhanced version
+patch_asyncbridge()
+
+# Import our AtroposServerModel (which will now use the patched AsyncBridge)
 from environments.smolagents_integration.atropos_smolagents_integration import AtroposServerModel
 
 # Configure logging
@@ -30,6 +36,15 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Set less verbose logging for our integration code
+logging.getLogger("environments.smolagents_integration").setLevel(logging.INFO)
+
+# Set even less verbose logging for other libraries
+logging.getLogger("httpx").setLevel(logging.ERROR)  # Reduce HTTP request noise
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
 
 
 def parse_args():

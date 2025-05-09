@@ -27,13 +27,18 @@ class OpenAIServer(APIServer):
     async def check_server_status_task(self, chat_completion: bool = True):
         while True:
             try:
-                if chat_completion:
+                # Check if model name suggests a chat model
+                is_chat_model = any(name in self.config.model_name.lower() for name in ["gpt-4", "gpt-3.5-turbo", "claude", "gemini", "o", "llama"])
+                
+                if is_chat_model:
+                    # Use chat completion endpoint for chat models
                     await self.openai.chat.completions.create(
                         model=self.config.model_name,
                         messages=[{"role": "user", "content": "hi"}],
                         max_tokens=1,
                     )
                 else:
+                    # Use regular completion endpoint for other models
                     await self.openai.completions.create(
                         model=self.config.model_name,
                         prompt="hi",
@@ -45,8 +50,11 @@ class OpenAIServer(APIServer):
                 openai.OpenAIError,
                 openai.APITimeoutError,
                 Exception,
-            ):
+            ) as e:
                 self.server_healthy = False
+                # Log the actual error for debugging
+                import logging
+                logging.getLogger(__name__).error(f"Health check failed: {str(e)}")
             await asyncio.sleep(1)
 
     async def _chat_completion_wrapper(self, **kwargs) -> ChatCompletion:
