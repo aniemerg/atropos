@@ -99,19 +99,54 @@ class AtroposServerModel(Model):
     def _format_chat_messages(self, messages):
         """Format messages for the chat completion API."""
         formatted_messages = []
-        for msg in messages:
+        
+        # For OpenAI API, we need to map roles to the ones they support
+        for i, msg in enumerate(messages):
             role = msg["role"]
             content = msg["content"]
-
+            
+            # Map any role to either system, user, or assistant
+            # If it's already a string, convert to lowercase
+            if isinstance(role, str):
+                role_str = role.lower()
+            # If it's an enum, get its string value
+            elif hasattr(role, "value"):
+                role_str = str(role.value).lower()
+            else:
+                # Default to string representation
+                role_str = str(role).lower()
+            
+            # Simplest mapping: 
+            # - "system" stays "system"
+            # - "user" stays "user"
+            # - "assistant" stays "assistant"
+            # - Everything else becomes "user" to guarantee compatibility
+            if role_str == "system":
+                openai_role = "system" 
+            elif role_str == "user":
+                openai_role = "user"
+            elif role_str == "assistant":
+                openai_role = "assistant"
+            else:
+                # Default everything else to user
+                openai_role = "user"
+                logger.info(f"Message {i}: Converting role '{role}' to 'user' for OpenAI API compatibility")
+            
             # Extract text content if it's in the list format
             if isinstance(content, list):
                 text_content = "\n".join(
                     item["text"] for item in content if item["type"] == "text"
                 )
-                formatted_messages.append({"role": role, "content": text_content})
+                formatted_messages.append({"role": openai_role, "content": text_content})
             else:
-                formatted_messages.append({"role": role, "content": content})
+                formatted_messages.append({"role": openai_role, "content": content})
 
+        # Log how many messages of each role we created
+        role_counts = {}
+        for msg in formatted_messages:
+            role_counts[msg["role"]] = role_counts.get(msg["role"], 0) + 1
+        logger.info(f"Formatted message roles: {role_counts}")
+        
         return formatted_messages
 
     def generate(
