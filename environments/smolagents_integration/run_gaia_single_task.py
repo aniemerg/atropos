@@ -292,18 +292,58 @@ def create_test_model(args):
     )
 
 
-async def run_task(args, task, model):
+def force_terminate_background_processes():
+    """Attempt to clean up any background processes that might be keeping 
+    the application hanging after timeout."""
+    import gc
+    import sys
+    import threading
+    
+    # Call garbage collector to clean up lingering objects
+    gc.collect()
+    
+    # Find and terminate stray threads
+    for thread in threading.enumerate():
+        if thread != threading.current_thread() and not thread.daemon:
+            try:
+                if hasattr(thread, '_tstate_lock') and thread._tstate_lock:
+                    thread._tstate_lock.release()
+            except Exception:
+                pass
+    
+    # Additional cleanup for specific libraries
+    # This is a best-effort attempt to clean up resources
+    libraries_to_clean = ['httpx', 'openai']
+    for module_name in list(sys.modules.keys()):
+        if any(library in module_name for library in libraries_to_clean):
+            if module_name in sys.modules:
+                module = sys.modules[module_name]
+                # Look for close or cleanup methods
+                for attr_name in dir(module):
+                    if 'close' in attr_name.lower() or 'cleanup' in attr_name.lower():
+                        try:
+                            attr = getattr(module, attr_name)
+                            if callable(attr):
+                                attr()
+                        except Exception:
+                            pass
+
+
+def run_task(args, task, model):
     """Run the GAIA benchmark task with the provided model."""
     # Create tools with file access
     tools = create_tools(task["file_name"])
 
     # Initialize CodeAgent with the specified number of steps
+    # LogLevel enum: 0=NONE, 1=ERROR, 2=INFO, 3=DEBUG, 4=TRACE
+    from smolagents.monitoring import LogLevel
+    
     agent = CodeAgent(
         tools=tools,
         model=model,
         max_steps=args.max_steps,  # Use the max steps from args
         additional_authorized_imports=["*"],  # Allow all imports for flexibility
-        verbosity_level=2,  # Set to INFO level
+        verbosity_level=LogLevel.DEBUG if args.debug else LogLevel.INFO,  # Use DEBUG level when --debug flag is used
     )
 
     # Construct the prompt
@@ -343,6 +383,38 @@ async def run_task(args, task, model):
                 result_queue.put(("error", error_msg))
                 
         # Start a thread to run the agent
+        import signal
+        import ctypes
+        import inspect
+        
+        # Define a helper function to force terminate a thread
+        def terminate_thread(thread):
+            """Terminate a thread forcefully."""
+            if not thread.is_alive():
+                return
+                
+            # Approach for CPython, get thread's ID to raise exception in it
+            tid = thread.ident
+            if tid is not None:
+                import sys
+                if sys.platform == 'darwin':  # MacOS
+                    # On MacOS, use a less extreme approach
+                    try:
+                        # First attempt: set a flag to check
+                        setattr(thread, "_terminate", True)
+                    except Exception:
+                        pass
+                else:  # Linux, Windows
+                    try:
+                        exc = ctypes.py_object(SystemExit)
+                        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), exc)
+                        if res > 1:
+                            # if it returns a number > 1, we're in trouble
+                            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), ctypes.c_long(0))
+                            logger.error("Failed to terminate thread cleanly")
+                    except Exception as e:
+                        logger.error(f"Error terminating thread: {e}")
+        
         thread = threading.Thread(target=run_agent)
         thread.daemon = True
         thread.start()
@@ -351,8 +423,20 @@ async def run_task(args, task, model):
         thread.join(timeout=args.timeout)  # Use the timeout from args
         
         if thread.is_alive():
-            # If the thread is still running after timeout, force quit
-            logger.error("Agent execution timed out")
+            # If the thread is still running after timeout, try to terminate it
+            logger.error("Agent execution timed out, attempting to terminate thread")
+            
+            # First attempt to terminate gently
+            terminate_thread(thread)
+            
+            # Give a small grace period for the thread to terminate
+            thread.join(timeout=1.0)
+            
+            # If it's still alive, try more aggressive cleanup
+            if thread.is_alive():
+                logger.warning("Thread still alive after termination attempt, cleaning up resources")
+                force_terminate_background_processes()
+            
             return {
                 "task_id": task["task_id"],
                 "question": task["question"],
@@ -465,6 +549,11 @@ async def main():
         model = create_test_model(args)
     else:
         model = await create_atropos_model(args)
+    
+    # Ensure we're using chat completion for models that require it
+    if model.model_id and any(name in model.model_id for name in ["gpt-4", "gpt-3.5-turbo", "claude", "gemini"]):
+        logger.info(f"Ensuring chat completion is enabled for {model.model_id}")
+        model.use_chat_completion = True
 
     # Run the task
     result = await run_task(args, task, model)
@@ -481,7 +570,14 @@ async def main():
     logger.info(f"Expected: {task['true_answer']}")
     logger.info(f"Actual: {result['prediction']}")
     logger.info(f"Results saved to: {output_path}")
+    
+    # Force cleanup of any lingering resources
+    force_terminate_background_processes()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Final cleanup to prevent hanging
+        force_terminate_background_processes()

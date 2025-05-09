@@ -40,21 +40,24 @@ class AtroposServerModel(Model):
             messages=messages, stop_sequences=stop_sequences, **kwargs
         )
 
-        # Extract the user message (for completion API)
-        prompt = self._extract_user_message(messages)
-
-        # Populate the necessary arguments for the Atropos server
-        server_args = {
-            "prompt": prompt,
-            "max_tokens": kwargs.get("max_tokens", 2048),
-            "temperature": kwargs.get("temperature", 0.0),
-            "stop": stop_sequences,
-        }
-
-        # For chat completion, we need to format messages differently
+        # Populate the server args based on completion type
         if self.use_chat_completion:
-            server_args["messages"] = self._format_chat_messages(messages)
-            server_args.pop("prompt", None)  # Remove prompt for chat completion
+            # For chat completion, we format messages and don't use prompt
+            server_args = {
+                "messages": self._format_chat_messages(messages),
+                "max_tokens": kwargs.get("max_tokens", 2048),
+                "temperature": kwargs.get("temperature", 0.0),
+                "stop": stop_sequences,
+            }
+        else:
+            # Extract the user message for completion API
+            prompt = self._extract_user_message(messages)
+            server_args = {
+                "prompt": prompt,
+                "max_tokens": kwargs.get("max_tokens", 2048),
+                "temperature": kwargs.get("temperature", 0.0),
+                "stop": stop_sequences,
+            }
 
         return server_args
 
@@ -133,100 +136,79 @@ class AtroposServerModel(Model):
                 # We're not in an event loop
                 pass
                 
-            if self.use_chat_completion:
-                if in_event_loop:
-                    # We're in an event loop, so create a new thread
-                    import threading
-                    import queue
-                    
-                    result_queue = queue.Queue()
-                    
-                    def thread_worker():
-                        try:
-                            # Create a new event loop for this thread
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            
-                            # Call the async method in this thread's event loop
-                            resp = loop.run_until_complete(
-                                self.server.chat_completion(**completion_kwargs)
-                            )
-                            if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
-                                content = resp.choices[0].message.content
-                                result_queue.put((resp, content))
-                            else:
-                                result_queue.put((resp, "No response content"))
-                        except Exception as e:
-                            result_queue.put((None, f"Error during Atropos server call: {str(e)}"))
-                            
-                    # Start a thread for the async call
-                    thread = threading.Thread(target=thread_worker)
-                    thread.daemon = True
-                    thread.start()
-                    thread.join(timeout=120)  # Wait up to 2 minutes
-                    
-                    if thread.is_alive():
-                        raise TimeoutError("Request timed out")
-                        
-                    # Get the result
-                    response, content = result_queue.get()
-                    if response is None:
-                        raise ValueError(f"Error in chat completion: {content}")
-                else:
-                    # We're not in an event loop, so create one
+            # Import required modules
+            import threading
+            import queue
+            import time
+            
+            # Create a queue for returning results
+            result_queue = queue.Queue()
+            
+            # Define the function to handle server calls in a separate thread
+            def thread_worker():
+                loop = None
+                try:
+                    # Create a new event loop for this thread
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    response = loop.run_until_complete(
-                        self.server.chat_completion(**completion_kwargs)
-                    )
-                    content = response.choices[0].message.content
-            else:
-                if in_event_loop:
-                    # We're in an event loop, so create a new thread
-                    import threading
-                    import queue
                     
-                    result_queue = queue.Queue()
-                    
-                    def thread_worker():
+                    # Call the appropriate server method
+                    if self.use_chat_completion:
+                        resp = loop.run_until_complete(
+                            self.server.chat_completion(**completion_kwargs)
+                        )
+                        if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
+                            content = resp.choices[0].message.content
+                            result_queue.put(("success", resp, content))
+                        else:
+                            result_queue.put(("success", resp, "No response content"))
+                    else:
+                        resp = loop.run_until_complete(
+                            self.server.completion(**completion_kwargs)
+                        )
+                        if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
+                            content = resp.choices[0].text
+                            result_queue.put(("success", resp, content))
+                        else:
+                            result_queue.put(("success", resp, "No response content"))
+                except Exception as e:
+                    result_queue.put(("error", None, f"Error during Atropos server call: {str(e)}"))
+                finally:
+                    # Clean up the event loop to prevent resource leaks
+                    if loop is not None:
                         try:
-                            # Create a new event loop for this thread
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
+                            # Cancel any pending tasks
+                            for task in asyncio.all_tasks(loop):
+                                task.cancel()
                             
-                            # Call the async method in this thread's event loop
-                            resp = loop.run_until_complete(
-                                self.server.completion(**completion_kwargs)
-                            )
-                            if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
-                                content = resp.choices[0].text
-                                result_queue.put((resp, content))
-                            else:
-                                result_queue.put((resp, "No response content"))
+                            # Ensure all async generators are properly shutdown
+                            loop.run_until_complete(loop.shutdown_asyncgens())
+                            
+                            # Close the loop
+                            loop.close()
                         except Exception as e:
-                            result_queue.put((None, f"Error during Atropos server call: {str(e)}"))
-                            
-                    # Start a thread for the async call
-                    thread = threading.Thread(target=thread_worker)
-                    thread.daemon = True
-                    thread.start()
-                    thread.join(timeout=120)  # Wait up to 2 minutes
-                    
-                    if thread.is_alive():
-                        raise TimeoutError("Request timed out")
-                        
-                    # Get the result
-                    response, content = result_queue.get()
-                    if response is None:
-                        raise ValueError(f"Error in completion: {content}")
-                else:
-                    # We're not in an event loop, so create one
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    response = loop.run_until_complete(
-                        self.server.completion(**completion_kwargs)
-                    )
-                    content = response.choices[0].text
+                            # Just log any errors during cleanup but don't propagate
+                            print(f"Error cleaning up event loop: {str(e)}")
+            
+            # Start a thread for the async call
+            thread = threading.Thread(target=thread_worker)
+            thread.daemon = True
+            thread.start()
+            
+            # Wait up to 2 minutes for the result
+            thread.join(timeout=120)
+            
+            # Check if thread is still running (timeout occurred)
+            if thread.is_alive():
+                raise TimeoutError("Request timed out after 120 seconds")
+            
+            # Get the result
+            if result_queue.empty():
+                raise ValueError("No result returned from server call")
+                
+            status, response, content = result_queue.get()
+            if status == "error":
+                raise ValueError(content)
 
             # Track token usage
             if hasattr(response, "usage"):
@@ -240,53 +222,5 @@ class AtroposServerModel(Model):
         except Exception as e:
             raise ValueError(f"Error during Atropos server call: {str(e)}")
 
-    def generate_stream(
-        self,
-        messages: list[dict[str, str | list[dict]]],
-        stop_sequences: list[str] | None = None,
-        grammar: str | None = None,
-        tools_to_call_from: list | None = None,
-        **kwargs,
-    ) -> Generator[ChatMessageStreamDelta]:
-        """
-        Stream the model's response by calling Atropos server.
-
-        This streaming implementation is disabled to avoid issues with event loops.
-        Instead, we get the full response at once and return it as a single chunk.
-
-        Parameters:
-            messages: A list of message dictionaries to be processed.
-            stop_sequences: A list of strings that will stop the generation if encountered.
-            grammar: The grammar or formatting structure to use (not used with Atropos).
-            tools_to_call_from: List of tools (not used with Atropos).
-            **kwargs: Additional keyword arguments for the server.
-
-        Yields:
-            ChatMessageStreamDelta: Stream of delta objects representing the model's response.
-        """
-        # Get the full response using the normal generate method
-        try:
-            # To avoid event loop issues, we use the non-streaming version and
-            # deliver the entire content as a single delta
-            import time
-            
-            # Add a small delay to prevent potential race conditions
-            time.sleep(0.1)
-            
-            # Get the full response
-            full_response = self.generate(
-                messages=messages,
-                stop_sequences=stop_sequences,
-                grammar=grammar,
-                tools_to_call_from=tools_to_call_from,
-                **kwargs,
-            )
-            
-            # Return the entire content as a single chunk
-            content = full_response.content if full_response and hasattr(full_response, 'content') and full_response.content else ""
-            yield ChatMessageStreamDelta(content=content)
-            
-        except Exception as e:
-            # If there's an error, yield an error message with detailed information
-            error_message = f"Error during streamed generation: {str(e)}"
-            yield ChatMessageStreamDelta(content=error_message)
+    # We don't need streaming for the current integration
+    # The generate_stream method has been removed to simplify the implementation
