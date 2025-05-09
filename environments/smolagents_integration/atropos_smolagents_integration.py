@@ -5,13 +5,16 @@ from typing import Any, Dict, List, Optional, Union
 
 from smolagents.models import ChatMessage, ChatMessageStreamDelta, MessageRole, Model
 
+# Import our AsyncBridge utility
+from atroposlib.utils.async_bridge import run_async
+
 
 class AtroposServerModel(Model):
     """
     A SmolaGents Model implementation that wraps Atropos servers.
 
     This class bridges the gap between SmolaGents' synchronous model interface and
-    Atropos' asynchronous server architecture.
+    Atropos' asynchronous server architecture using AsyncBridge.
 
     Parameters:
         server: An Atropos server instance (OpenAIServer or ServerManager)
@@ -101,7 +104,8 @@ class AtroposServerModel(Model):
         **kwargs,
     ) -> ChatMessage:
         """
-        Process the input messages and return the model's response by calling Atropos server.
+        Process the input messages and return the model's response.
+        Uses AsyncBridge to run the async method without creating new threads.
 
         Parameters:
             messages: A list of message dictionaries to be processed.
@@ -116,111 +120,57 @@ class AtroposServerModel(Model):
         # Special handling for CodeAgent stop sequences
         if stop_sequences is None:
             stop_sequences = ["Observation:", "<end_code>", "Calling tools:"]
-
-        # Prepare the completion arguments
+        
+        # Prepare completion arguments
         completion_kwargs = self._prepare_completion_args(
             messages=messages, stop_sequences=stop_sequences, **kwargs
         )
-
-        # Bridge the async/sync boundary and call Atropos server
+        
+        # Extract timeout from kwargs or use default
+        timeout = kwargs.pop("timeout", 120)  # Default 2 minutes
+        
         try:
-            # Use a simple approach to handle the asyncio call properly
-            # We need to respect Atropos's server handling
-            
-            # Check if we're already inside an event loop
-            in_event_loop = False
-            try:
-                asyncio.get_running_loop()
-                in_event_loop = True
-            except RuntimeError:
-                # We're not in an event loop
-                pass
+            # Use AsyncBridge to call the async method
+            if self.use_chat_completion:
+                # Call chat_completion via AsyncBridge
+                resp = run_async(
+                    self.server.chat_completion,
+                    **completion_kwargs,
+                    timeout=timeout
+                )
                 
-            # Import required modules
-            import threading
-            import queue
-            import time
-            
-            # Create a queue for returning results
-            result_queue = queue.Queue()
-            
-            # Define the function to handle server calls in a separate thread
-            def thread_worker():
-                loop = None
-                try:
-                    # Create a new event loop for this thread
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
-                    # Call the appropriate server method
-                    if self.use_chat_completion:
-                        resp = loop.run_until_complete(
-                            self.server.chat_completion(**completion_kwargs)
-                        )
-                        if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
-                            content = resp.choices[0].message.content
-                            result_queue.put(("success", resp, content))
-                        else:
-                            result_queue.put(("success", resp, "No response content"))
-                    else:
-                        resp = loop.run_until_complete(
-                            self.server.completion(**completion_kwargs)
-                        )
-                        if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
-                            content = resp.choices[0].text
-                            result_queue.put(("success", resp, content))
-                        else:
-                            result_queue.put(("success", resp, "No response content"))
-                except Exception as e:
-                    result_queue.put(("error", None, f"Error during Atropos server call: {str(e)}"))
-                finally:
-                    # Clean up the event loop to prevent resource leaks
-                    if loop is not None:
-                        try:
-                            # Cancel any pending tasks
-                            for task in asyncio.all_tasks(loop):
-                                task.cancel()
-                            
-                            # Ensure all async generators are properly shutdown
-                            loop.run_until_complete(loop.shutdown_asyncgens())
-                            
-                            # Close the loop
-                            loop.close()
-                        except Exception as e:
-                            # Just log any errors during cleanup but don't propagate
-                            print(f"Error cleaning up event loop: {str(e)}")
-            
-            # Start a thread for the async call
-            thread = threading.Thread(target=thread_worker)
-            thread.daemon = True
-            thread.start()
-            
-            # Wait up to 2 minutes for the result
-            thread.join(timeout=120)
-            
-            # Check if thread is still running (timeout occurred)
-            if thread.is_alive():
-                raise TimeoutError("Request timed out after 120 seconds")
-            
-            # Get the result
-            if result_queue.empty():
-                raise ValueError("No result returned from server call")
+                # Process response
+                if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
+                    content = resp.choices[0].message.content
+                else:
+                    content = "No response content"
+            else:
+                # Call completion via AsyncBridge
+                resp = run_async(
+                    self.server.completion,
+                    **completion_kwargs,
+                    timeout=timeout
+                )
                 
-            status, response, content = result_queue.get()
-            if status == "error":
-                raise ValueError(content)
-
+                # Process response
+                if resp and hasattr(resp, 'choices') and len(resp.choices) > 0:
+                    content = resp.choices[0].text
+                else:
+                    content = "No response content"
+            
             # Track token usage
-            if hasattr(response, "usage"):
-                self.last_input_token_count = response.usage.prompt_tokens
-                self.last_output_token_count = response.usage.completion_tokens
-
-            # Return in SmolaGents' format
+            if hasattr(resp, "usage"):
+                self.last_input_token_count = resp.usage.prompt_tokens
+                self.last_output_token_count = resp.usage.completion_tokens
+            
+            # Return result in SmolaGents format
             return ChatMessage(
-                role=MessageRole.ASSISTANT, content=content, raw=response
+                role=MessageRole.ASSISTANT, content=content, raw=resp
             )
+            
         except Exception as e:
-            raise ValueError(f"Error during Atropos server call: {str(e)}")
+            # Provide more detailed error information
+            error_msg = f"Error during Atropos server call: {type(e).__name__}: {str(e)}"
+            raise ValueError(error_msg)
 
     # We don't need streaming for the current integration
-    # The generate_stream method has been removed to simplify the implementation

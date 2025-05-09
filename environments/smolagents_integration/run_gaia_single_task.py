@@ -581,3 +581,7 @@ if __name__ == "__main__":
     finally:
         # Final cleanup to prevent hanging
         force_terminate_background_processes()
+        
+        # Clean up AsyncBridge
+        from atroposlib.utils.async_bridge import shutdown_bridge
+        shutdown_bridge()

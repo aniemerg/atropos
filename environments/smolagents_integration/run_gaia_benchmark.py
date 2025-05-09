@@ -10,6 +10,10 @@ import argparse
 import asyncio
 import logging
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig
 from atroposlib.envs.server_handling.server_manager import ServerManager
@@ -100,15 +104,23 @@ async def main():
     """Main function to set up and run the GAIA benchmark."""
     args = parse_args()
 
+    # Get API key from command line or environment variable
+    api_key = args.api_key
+    if api_key == "YOUR_API_KEY" or api_key == "x":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("No OpenAI API key provided. Set OPENAI_API_KEY environment variable or use --api-key")
+    
     # Create server configuration
     server_config = OpenaiConfig(
-        api_key=args.api_key,
+        api_key=api_key,
         base_url=args.base_url,
         model_name=args.model_name,
         timeout=args.timeout,
     )
 
-    # Create environment configuration
+    # Create environment configuration with a standard tokenizer
+    # Use gpt2 tokenizer as a fallback that's widely available and unlikely to cause issues
     env_config = GAIABenchmarkConfig(
         dataset_path=args.dataset_path,
         split=args.split,
@@ -117,12 +129,14 @@ async def main():
         use_chat_completion=args.use_chat_completion,
         use_wandb=args.use_wandb,
         wandb_name=args.wandb_name,
+        tokenizer_name="gpt2"  # Use a standard tokenizer that's widely available
     )
 
     # Create and run the environment
+    # Make sure server_config is passed as a list since that's what the environment expects
     env = GAIABenchmarkEnv(
         config=env_config,
-        server_configs=server_config,
+        server_configs=[server_config],  # Put the config in a list
         slurm=False,
         testing=False,
     )
@@ -134,4 +148,13 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Clean up AsyncBridge to prevent hanging
+        from atroposlib.utils.async_bridge import shutdown_bridge
+        shutdown_bridge()
+        
+        # Also attempt to clean up any other resources
+        from environments.smolagents_integration.run_gaia_single_task import force_terminate_background_processes
+        force_terminate_background_processes()
