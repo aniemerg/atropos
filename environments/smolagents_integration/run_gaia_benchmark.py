@@ -11,16 +11,19 @@ import asyncio
 import logging
 import os
 from dotenv import load_dotenv
+import zipfile
+import tempfile
+import os
 
 # Load environment variables from .env file
 load_dotenv()
 
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig
 from atroposlib.envs.server_handling.server_manager import ServerManager
-from environments.smolagents_integration.gaia_benchmark_env import (
-    GAIABenchmarkConfig,
-    GAIABenchmarkEnv,
-)
+from smolagents import CodeAgent, tool
+from smolagents.default_tools import PythonInterpreterTool, FinalAnswerTool
+
+from environments.smolagents_integration.atropos_smolagents_integration import AtroposServerModel
 
 # Configure logging
 logging.basicConfig(
@@ -55,9 +58,6 @@ def parse_args():
         help="Maximum number of steps for the agent",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=1, help="Batch size for training"
-    )
-    parser.add_argument(
         "--use-chat-completion",
         action="store_true",
         help="Use chat completion API instead of completion API",
@@ -68,27 +68,46 @@ def parse_args():
         "--api-key",
         type=str,
         default="x",
-        help="API key for OpenAI API. Use 'x' for local servers.",
+        help="API key for OpenAI API. Use 'x' to use OPENAI_API_KEY env var.",
     )
     parser.add_argument(
         "--base-url",
         type=str,
-        default="http://localhost:8000/v1",
+        default="https://api.openai.com/v1",
         help="URL of the API endpoint",
     )
     parser.add_argument(
-        "--model-name", type=str, default="gpt-3.5-turbo", help="Model name to use"
+        "--model-name", 
+        type=str, 
+        default="gpt-4o", 
+        help="Model name to use"
     )
     parser.add_argument(
         "--timeout",
         type=int,
-        default=120,
-        help="Timeout for server requests in seconds",
+        default=180,
+        help="Timeout for agent execution in seconds",
+    )
+    
+    # Output configuration
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="output/gaia",
+        help="Output directory for results",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit the number of tasks to run (for testing)",
     )
 
     # Wandb configuration
     parser.add_argument(
-        "--use-wandb", action="store_true", help="Whether to use wandb for logging"
+        "--use-wandb", 
+        action="store_true", 
+        help="Whether to use wandb for logging"
     )
     parser.add_argument(
         "--wandb-name",
@@ -100,10 +119,76 @@ def parse_args():
     return parser.parse_args()
 
 
-async def main():
-    """Main function to set up and run the GAIA benchmark."""
-    args = parse_args()
+def get_zip_contents(zip_path):
+    """Extract the contents of a ZIP file and return them as a dictionary."""
+    result = {}
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        for file_info in zip_ref.infolist():
+            if not file_info.is_dir():
+                with zip_ref.open(file_info) as file:
+                    try:
+                        result[file_info.filename] = file.read().decode('utf-8')
+                    except UnicodeDecodeError:
+                        # For binary files, just note that it's binary
+                        result[file_info.filename] = "[Binary content]"
+    return result
 
+def create_tools(file_path=None):
+    """Create tools for the CodeAgent."""
+    tools = []
+    
+    # Add Python tool
+    python_tool = PythonInterpreterTool(authorized_imports=["*"])
+    tools.append(python_tool)
+    
+    # Add final answer tool 
+    tools.append(FinalAnswerTool())
+    
+    # Define file reader tool using decorator
+    @tool
+    def file_reader(path: str = None) -> str:
+        """Read contents of a file.
+        
+        Args:
+            path: Path to file (optional)
+        """
+        try:
+            # If no path specified but we have a file from the task, use that
+            if not path and file_path:
+                path = file_path
+
+            if not path:
+                return "No file path specified"
+
+            # Handle zip files
+            if path.endswith(".zip"):
+                contents = get_zip_contents(path)
+                # Format as a list of files with summary
+                return (
+                    f"ZIP archive containing {len(contents)} files:\n"
+                    + "\n".join(f"- {name}" for name in contents.keys())
+                    + "\n\nUse the python_interpreter tool to access specific files."
+                )
+
+            # Regular file
+            with open(path, "r") as f:
+                return f.read()
+        except Exception as e:
+            return f"Error reading file at {path}: {str(e)}"
+            
+    tools.append(file_reader)
+    
+    return tools
+
+async def run_gaia_benchmark():
+    """Run the GAIA benchmark using SmolaGents directly."""
+    args = parse_args()
+    logger.info(f"Starting run with arguments: {args}")
+    
+    # Import here to avoid circular imports
+    import datasets
+    from datasets import load_dataset
+    
     # Get API key from command line or environment variable
     api_key = args.api_key
     if api_key == "YOUR_API_KEY" or api_key == "x":
@@ -111,40 +196,188 @@ async def main():
         if not api_key:
             raise ValueError("No OpenAI API key provided. Set OPENAI_API_KEY environment variable or use --api-key")
     
-    # Create server configuration
+    # Create server configuration and OpenAI server
     server_config = OpenaiConfig(
         api_key=api_key,
         base_url=args.base_url,
         model_name=args.model_name,
         timeout=args.timeout,
     )
-
-    # Create environment configuration with a standard tokenizer
-    # Use gpt2 tokenizer as a fallback that's widely available and unlikely to cause issues
-    env_config = GAIABenchmarkConfig(
-        dataset_path=args.dataset_path,
-        split=args.split,
-        max_steps=args.max_steps,
-        batch_size=args.batch_size,
+    
+    # Create OpenAIServer instance
+    from atroposlib.envs.server_handling.openai_server import OpenAIServer
+    server = OpenAIServer(server_config)
+    
+    # Create AtroposServerModel
+    model = AtroposServerModel(
+        server=server,
         use_chat_completion=args.use_chat_completion,
-        use_wandb=args.use_wandb,
-        wandb_name=args.wandb_name,
-        tokenizer_name="gpt2"  # Use a standard tokenizer that's widely available
+        model_id=f"atropos-{args.model_name}",
     )
+    
+    # Load the GAIA dataset
+    logger.info(f"Loading GAIA dataset (split: {args.split})")
+    try:
+        dataset = load_dataset("gaia_benchmark", "2023_all", split=args.split)
+        
+        # Preprocess dataset to add file paths
+        def preprocess_file_paths(example):
+            if example.get("file_name"):
+                example["file_path"] = f"{args.dataset_path}/{args.split}/{example['file_name']}"
+            else:
+                example["file_path"] = ""
+            return example
+            
+        dataset = dataset.map(preprocess_file_paths)
+        logger.info(f"Loaded {len(dataset)} examples from GAIA dataset")
+    
+    except Exception as e:
+        logger.error(f"Error loading dataset: {e}")
+        # Fallback to a dummy dataset for testing
+        logger.info("Using fallback dummy dataset for testing")
+        dataset = [
+            {
+                "task_id": "GAIA2023_P001",
+                "Question": "Write a Python function to check if a string is a palindrome",
+                "Final answer": "def is_palindrome(s):\n    return s == s[::-1]",
+                "Level": "programming",
+                "file_name": "",
+                "file_path": ""
+            }
+        ]
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    results = []
+    
+    # Process each task
+    for i, example in enumerate(dataset):
+        task_id = example.get("task_id", f"task_{i}")
+        question = example.get("Question", example.get("question", ""))
+        true_answer = example.get("Final answer", example.get("true_answer", ""))
+        file_path = example.get("file_path", "")
+        
+        logger.info(f"Running agent on task: {task_id}")
+        logger.info(f"Prompt: {question}")
+        
+        # Create tools with the current file path
+        tools = create_tools(file_path)
+        
+        # Create agent
+        agent = CodeAgent(
+            tools=tools,
+            model=model,
+            max_steps=args.max_steps,
+            additional_authorized_imports=["*"],  # Allow all imports for flexibility
+            verbosity_level=2,  # Set to INFO level
+        )
+        
+        # Prepare prompt with file information if available
+        prompt = question
+        if file_path:
+            prompt += f"\n\nTo solve this task, you can use the file at: {file_path}"
+        
+        # Run agent
+        try:
+            logger.info(f"Running agent with timeout of {args.timeout} seconds")
+            # Set a timeout for the agent
+            import threading
+            import queue
+            
+            result_queue = queue.Queue()
+            
+            def run_agent():
+                try:
+                    result = agent.run(prompt)
+                    result_queue.put(("success", result))
+                except Exception as e:
+                    result_queue.put(("error", str(e)))
+            
+            thread = threading.Thread(target=run_agent)
+            thread.daemon = True
+            thread.start()
+            
+            # Wait for the thread to complete or timeout
+            thread.join(timeout=args.timeout)
+            
+            if thread.is_alive():
+                logger.error("Agent execution timed out")
+                result = "Agent timed out"
+                agent_memory = []
+                is_correct = False
+            else:
+                # Get the result
+                if not result_queue.empty():
+                    status, result = result_queue.get()
+                    if status == "error":
+                        logger.error(f"Agent failed: {result}")
+                        result = f"Error: {result}"
+                        agent_memory = []
+                        is_correct = False
+                    else:
+                        # Get agent memory for detailed output
+                        try:
+                            agent_memory = agent.write_memory_to_messages()
+                        except Exception as memory_e:
+                            logger.error(f"Error getting agent memory: {memory_e}")
+                            agent_memory = []
+                        
+                        # Evaluate the result
+                        is_correct = true_answer.lower() in result.lower()
+                else:
+                    result = "No result from agent"
+                    agent_memory = []
+                    is_correct = False
+            
+            # Save the result
+            task_result = {
+                "task_id": task_id,
+                "question": question,
+                "true_answer": true_answer,
+                "prediction": result,
+                "correct": is_correct,
+                "agent_memory": agent_memory,
+                "num_steps": len(agent.memory.steps) if hasattr(agent, 'memory') and hasattr(agent.memory, 'steps') else 0,
+            }
+            results.append(task_result)
+            
+            # Save individual result
+            import json
+            output_path = os.path.join(args.output_dir, f"{task_id}_result.json")
+            with open(output_path, "w") as f:
+                json.dump(task_result, f, indent=2)
+            
+            logger.info(f"Task {task_id} completed: {'✓ Correct' if is_correct else '✗ Incorrect'}")
+            logger.info(f"Results saved to: {output_path}")
+            
+        except Exception as e:
+            logger.error(f"Error processing task {task_id}: {e}")
+    
+    # Save all results
+    import json
+    output_path = os.path.join(args.output_dir, "all_results.json")
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+    
+    logger.info(f"All results saved to: {output_path}")
+    
+    # Calculate overall accuracy
+    correct_count = sum(1 for result in results if result["correct"])
+    total_count = len(results)
+    accuracy = correct_count / total_count if total_count > 0 else 0
+    
+    logger.info(f"Benchmark complete: {correct_count}/{total_count} correct ({accuracy:.2%} accuracy)")
+    
+    return results
 
-    # Create and run the environment
-    # Make sure server_config is passed as a list since that's what the environment expects
-    env = GAIABenchmarkEnv(
-        config=env_config,
-        server_configs=[server_config],  # Put the config in a list
-        slurm=False,
-        testing=False,
-    )
-
-    logger.info("Starting GAIA benchmark environment")
-
-    # Run the environment's manager
-    await env.env_manager()
+async def main():
+    """Main function entry point."""
+    try:
+        await run_gaia_benchmark()
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
