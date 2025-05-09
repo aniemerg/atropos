@@ -13,7 +13,6 @@ import os
 from dotenv import load_dotenv
 import zipfile
 import tempfile
-import os
 
 # Load environment variables from .env file
 load_dotenv()
@@ -233,12 +232,36 @@ async def run_gaia_benchmark():
     # Load the GAIA dataset
     logger.info(f"Loading GAIA dataset (split: {args.split})")
     try:
-        dataset = load_dataset("gaia_benchmark", "2023_all", split=args.split)
+        # Calculate project root dynamically based on the script's location
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.abspath(os.path.join(script_dir, "../.."))
+        gaia_script_path = os.path.join(project_root, "data/gaia/GAIA.py")
+        logger.info(f"Project root: {project_root}")
+        logger.info(f"Using GAIA script at: {gaia_script_path}")
+        
+        # Set the data directory environment variable to help GAIA.py find the files
+        gaia_data_dir = os.path.join(project_root, "data/gaia/2023")
+        os.environ["GAIA_DATA_DIR"] = gaia_data_dir
+        logger.info(f"Set GAIA_DATA_DIR to: {gaia_data_dir}")
+        
+        dataset = load_dataset(
+            gaia_script_path,
+            name="2023_all",
+            split=args.split,
+            trust_remote_code=True  # Avoid the prompt asking to run custom code
+        )
         
         # Preprocess dataset to add file paths
         def preprocess_file_paths(example):
-            if example.get("file_name"):
-                example["file_path"] = f"{args.dataset_path}/{args.split}/{example['file_name']}"
+            if example.get("file_name") and example["file_name"]:
+                # Use absolute path to the files in the 2023 subdirectory
+                file_path = os.path.join(gaia_data_dir, args.split, example['file_name'])
+                example["file_path"] = file_path
+                # Only log if the file exists to avoid excessive logging
+                if os.path.exists(file_path):
+                    logger.info(f"Set file path: {file_path}")
+                else:
+                    logger.warning(f"File does not exist: {file_path}")
             else:
                 example["file_path"] = ""
             return example
