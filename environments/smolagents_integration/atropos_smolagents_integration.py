@@ -18,7 +18,7 @@ except ImportError:
 
 # Configure logger for the model class
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)  # Reduced from INFO to WARNING
 
 
 class AtroposServerModel(Model):

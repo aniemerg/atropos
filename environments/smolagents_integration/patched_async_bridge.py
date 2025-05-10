@@ -15,7 +15,7 @@ from atroposlib.utils.async_bridge import run_async as original_run_async
 from atroposlib.utils.async_bridge import _BRIDGE, get_bridge as original_get_bridge
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)  # Reduced from INFO to WARNING
 
 # Type variables for generic typing
 T = TypeVar('T')

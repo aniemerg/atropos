@@ -20,7 +20,7 @@ load_dotenv()
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig
 from atroposlib.envs.server_handling.server_manager import ServerManager
 from smolagents import CodeAgent, tool
-from smolagents.default_tools import PythonInterpreterTool, FinalAnswerTool
+# We no longer need to import PythonInterpreterTool and FinalAnswerTool
 
 # Import our patched AsyncBridge and apply the patch
 from environments.smolagents_integration.patched_async_bridge import patch_asyncbridge
@@ -32,17 +32,19 @@ from environments.smolagents_integration.atropos_smolagents_integration import A
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Set less verbose logging for our integration code
-logging.getLogger("environments.smolagents_integration").setLevel(logging.INFO)
+# Set quiet logging for our integration code
+logging.getLogger("environments.smolagents_integration").setLevel(logging.WARNING)
+logging.getLogger("environments.smolagents_integration.patched_async_bridge").setLevel(logging.ERROR)
+logging.getLogger("environments.smolagents_integration.atropos_smolagents_integration").setLevel(logging.ERROR)
 
 # Set even less verbose logging for other libraries
 logging.getLogger("httpx").setLevel(logging.ERROR)  # Reduce HTTP request noise
-logging.getLogger("asyncio").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+logging.getLogger("openai").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 
 
@@ -151,46 +153,70 @@ def create_tools(file_path=None):
     """Create tools for the CodeAgent."""
     tools = []
     
-    # Add Python tool
-    python_tool = PythonInterpreterTool(authorized_imports=["*"])
-    tools.append(python_tool)
-    
-    # Add final answer tool 
-    tools.append(FinalAnswerTool())
-    
-    # Define file reader tool using decorator
-    @tool
-    def file_reader(path: str = None) -> str:
-        """Read contents of a file.
+    # Add file tools
+    try:
+        from environments.smolagents_integration.tools.file_tools import read_file, write_file, append_to_file
+        tools.extend([read_file, write_file, append_to_file])
+        logger.info("File tools added successfully")
+    except ImportError as e:
+        logger.error(f"Failed to import file tools: {e}")
         
-        Args:
-            path: Path to file (optional)
-        """
-        try:
-            # If no path specified but we have a file from the task, use that
-            if not path and file_path:
-                path = file_path
-
-            if not path:
-                return "No file path specified"
-
-            # Handle zip files
-            if path.endswith(".zip"):
-                contents = get_zip_contents(path)
-                # Format as a list of files with summary
-                return (
-                    f"ZIP archive containing {len(contents)} files:\n"
-                    + "\n".join(f"- {name}" for name in contents.keys())
-                    + "\n\nUse the python_interpreter tool to access specific files."
-                )
-
-            # Regular file
-            with open(path, "r") as f:
-                return f.read()
-        except Exception as e:
-            return f"Error reading file at {path}: {str(e)}"
+        # Fallback to simpler file reader if needed
+        @tool
+        def file_reader(path: str = None) -> str:
+            """Read contents of a file.
             
-    tools.append(file_reader)
+            Args:
+                path: Path to file (optional)
+            """
+            try:
+                # If no path specified but we have a file from the task, use that
+                if not path and file_path:
+                    path = file_path
+
+                if not path:
+                    return "No file path specified"
+
+                # Handle zip files
+                if path.endswith(".zip"):
+                    contents = get_zip_contents(path)
+                    # Format as a list of files with summary
+                    return (
+                        f"ZIP archive containing {len(contents)} files:\n"
+                        + "\n".join(f"- {name}" for name in contents.keys())
+                        + "\n\nUse python code to access specific files."
+                    )
+
+                # Regular file
+                with open(path, "r") as f:
+                    return f.read()
+            except Exception as e:
+                return f"Error reading file at {path}: {str(e)}"
+                
+        tools.append(file_reader)
+    
+    # Add Tavily web tools
+    tavily_api_key = os.environ.get("TAVILY_API_KEY")
+    if tavily_api_key:
+        try:
+            # Check for tavily package
+            import importlib.util
+            if importlib.util.find_spec("tavily") is None:
+                logger.warning("Tavily package not installed. Install with: pip install tavily-python")
+            else:
+                from environments.smolagents_integration.tools.tavily_tools import TavilySearchTool, TavilyExtractTool
+                tools.extend([
+                    TavilySearchTool(api_key=tavily_api_key),
+                    TavilyExtractTool(api_key=tavily_api_key)
+                ])
+                logger.info("Tavily web tools added successfully")
+        except Exception as e:
+            logger.warning(f"Error initializing Tavily tools: {e}")
+    else:
+        logger.info("TAVILY_API_KEY not found in environment, web tools will not be available")
+    
+    # Note: PythonInterpreterTool is NOT needed as CodeAgent already has Python execution capability
+    # Note: FinalAnswerTool is automatically added by the CodeAgent/MultiStepAgent class
     
     return tools
 
@@ -301,12 +327,12 @@ async def run_gaia_benchmark():
         # Create tools with the current file path
         tools = create_tools(file_path)
         
-        # Create agent
+        # Create agent with specific authorized imports for the tools
         agent = CodeAgent(
             tools=tools,
             model=model,
             max_steps=args.max_steps,
-            additional_authorized_imports=["*"],  # Allow all imports for flexibility
+            additional_authorized_imports=["os", "json", "re", "datetime", "requests", "zipfile", "textwrap"],
             verbosity_level=2,  # Set to INFO level
         )
         

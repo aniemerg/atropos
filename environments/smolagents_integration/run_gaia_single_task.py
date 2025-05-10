@@ -27,7 +27,7 @@ from environments.smolagents_integration.atropos_smolagents_integration import (
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -168,82 +168,105 @@ def load_task(dataset_path: str, split: str, task_id: str) -> Dict[str, Any]:
 
 
 def create_tools(file_path: Optional[str] = None) -> List[Tool]:
-    """Create tools for the CodeAgent, including file access tools."""
-
+    """Create tools for the CodeAgent, including file access tools and web tools."""
     tools = []
-
-    # Create Python execution tool using decorator
-    @tool
-    def python(code: str) -> str:
-        """Execute Python code safely.
+    
+    # Add file tools
+    try:
+        from environments.smolagents_integration.tools.file_tools import read_file, write_file, append_to_file
+        tools.extend([read_file, write_file, append_to_file])
+        logger.info("File tools added successfully")
+    except ImportError as e:
+        logger.error(f"Failed to import file tools: {e}")
         
-        Args:
-            code: Python code to execute
-        """
+        # Fallback to simpler file reader if needed
+        @tool
+        def file_reader(path: Optional[str] = None) -> str:
+            """Read contents of a file.
+            
+            Args:
+                path: Path to file (optional)
+            """
+            try:
+                # If no path specified but we have a file from the task, use that
+                if not path and file_path:
+                    path = file_path
+
+                if not path:
+                    return "No file path specified"
+
+                # Handle zip files
+                if path.endswith(".zip"):
+                    contents = get_zip_contents(path)
+                    # Format as a list of files with summary
+                    return (
+                        f"ZIP archive containing {len(contents)} files:\n"
+                        + "\n".join(f"- {name}" for name in contents.keys())
+                        + "\n\nUse python code to access specific files."
+                    )
+
+                # Regular file
+                with open(path, "r") as f:
+                    return f.read()
+            except Exception as e:
+                return f"Error reading file at {path}: {str(e)}"
+                
+        tools.append(file_reader)
+    
+    # Add Tavily web tools
+    tavily_api_key = os.environ.get("TAVILY_API_KEY")
+    if tavily_api_key:
         try:
-            # Create a namespace for execution
-            namespace = {}
-
-            # Add file contents to namespace if available
-            if file_path:
-                if file_path.endswith(".zip"):
-                    namespace["zip_contents"] = get_zip_contents(file_path)
-                else:
-                    try:
-                        with open(file_path, "r") as f:
-                            namespace["file_contents"] = f.read()
-                    except Exception as e:
-                        return f"Error reading file: {str(e)}"
-
-            # Execute the code in the namespace
-            exec(code, namespace)
-
-            # Check for a result variable
-            if "result" in namespace:
-                return str(namespace["result"])
-
-            # Otherwise return success
-            return "Code executed successfully (no result variable found)"
+            # Check for tavily package
+            import importlib.util
+            if importlib.util.find_spec("tavily") is None:
+                logger.warning("Tavily package not installed. Install with: pip install tavily-python")
+            else:
+                from environments.smolagents_integration.tools.tavily_tools import TavilySearchTool, TavilyExtractTool
+                tools.extend([
+                    TavilySearchTool(api_key=tavily_api_key),
+                    TavilyExtractTool(api_key=tavily_api_key)
+                ])
+                logger.info("Tavily web tools added successfully")
         except Exception as e:
-            return f"Error executing code: {str(e)}"
-
-    tools.append(python)
-
-    # Create file reader tool using decorator
-    @tool
-    def file_reader(path: Optional[str] = None) -> str:
-        """Read contents of a file.
+            logger.warning(f"Error initializing Tavily tools: {e}")
+    else:
+        logger.info("TAVILY_API_KEY not found in environment, web tools will not be available")
+    
+    # Add special handling for zip files for the current task
+    if file_path and file_path.endswith(".zip"):
+        # Add zip contents to be accessible by Python code
+        zip_contents = get_zip_contents(file_path)
         
-        Args:
-            path: Path to file (optional)
-        """
-        try:
-            # If no path specified but we have a file from the task, use that
-            if not path and file_path:
-                path = file_path
-
-            if not path:
-                return "No file path specified"
-
-            # Handle zip files
-            if path.endswith(".zip"):
-                contents = get_zip_contents(path)
-                # Format as a list of files with summary
-                return (
-                    f"ZIP archive containing {len(contents)} files:\n"
-                    + "\n".join(f"- {name}" for name in contents.keys())
-                    + "\n\nUse the python tool to access specific files by using "
-                    + "the zip_contents dictionary."
-                )
-
-            # Regular file
-            with open(path, "r") as f:
-                return f.read()
-        except Exception as e:
-            return f"Error reading file at {path}: {str(e)}"
-
-    tools.append(file_reader)
-
+        # Register tool to list zip contents
+        @tool
+        def list_zip_files() -> str:
+            """List all files in the provided zip archive."""
+            return (
+                f"ZIP archive containing {len(zip_contents)} files:\n"
+                + "\n".join(f"- {name}" for name in zip_contents.keys())
+            )
+        
+        tools.append(list_zip_files)
+        
+        # Register tool to read specific file from zip
+        @tool
+        def read_zip_file(file_name: str) -> str:
+            """Read a specific file from the zip archive.
+            
+            Args:
+                file_name: Name of the file within the zip to read
+            """
+            if file_name in zip_contents:
+                return zip_contents[file_name]
+            else:
+                return f"File '{file_name}' not found in the zip archive. Available files: {', '.join(zip_contents.keys())}"
+                
+        tools.append(read_zip_file)
+    
+    # Note: PythonInterpreterTool is NOT needed as CodeAgent already has Python execution capability
+    # Note: FinalAnswerTool is automatically added by the CodeAgent/MultiStepAgent class
+    
     return tools
 
 
@@ -342,7 +365,7 @@ def run_task(args, task, model):
         tools=tools,
         model=model,
         max_steps=args.max_steps,  # Use the max steps from args
-        additional_authorized_imports=["*"],  # Allow all imports for flexibility
+        additional_authorized_imports=["os", "json", "re", "datetime", "requests", "zipfile", "textwrap"],
         verbosity_level=LogLevel.DEBUG if args.debug else LogLevel.INFO,  # Use DEBUG level when --debug flag is used
     )
 
@@ -532,6 +555,12 @@ async def main():
         logging.getLogger("smolagents").setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled")
+    else:
+        # Keep logging minimal unless debug is enabled
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger("environments.smolagents_integration").setLevel(logging.ERROR)
+        logging.getLogger("httpx").setLevel(logging.ERROR)
+        logging.getLogger("smolagents").setLevel(logging.WARNING)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)

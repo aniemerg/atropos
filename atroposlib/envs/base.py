@@ -48,7 +48,7 @@ from .server_handling.server_manager import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)  # Reduced from DEBUG to WARNING
 
 
 class ScoredDataGroup(TypedDict):
