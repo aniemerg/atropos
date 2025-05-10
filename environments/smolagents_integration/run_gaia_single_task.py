@@ -592,13 +592,32 @@ async def main():
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
 
-    # Print the result
-    logger.info(
-        f"Task completed: {'✓ Correct' if result['correct'] else '✗ Incorrect'}"
-    )
-    logger.info(f"Expected: {task['true_answer']}")
-    logger.info(f"Actual: {result['prediction']}")
-    logger.info(f"Results saved to: {output_path}")
+    # Print the result with clearer formatting
+    print("\n" + "="*80)
+    print(f"TASK RESULTS: {args.task_id}")
+    print("="*80)
+    print(f"STATUS: {'✅ CORRECT' if result['correct'] else '❌ INCORRECT'}")
+    print("-"*80)
+    print("QUESTION:")
+    print(f"{task['question']}")
+    print("-"*80)
+    print("EXPECTED ANSWER:")
+    print(f"{task['true_answer']}")
+    print("-"*80)
+    print("AGENT'S ANSWER:")
+    print(f"{result['prediction']}")
+    print("-"*80)
+    if result['correct']:
+        print("EXPLANATION: The agent's answer correctly matches the expected answer.")
+    else:
+        print("EXPLANATION: The agent's answer does not match the expected answer.")
+        # Add more detail about the mismatch
+        if task['true_answer'].lower() in result['prediction'].lower():
+            print("NOTE: The expected answer is contained in the agent's answer but in a different format.")
+    print("-"*80)
+    print(f"Number of steps: {result['num_steps']}")
+    print(f"Results saved to: {output_path}")
+    print("="*80 + "\n")
     
     # Force cleanup of any lingering resources
     force_terminate_background_processes()

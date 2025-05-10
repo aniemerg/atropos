@@ -411,8 +411,34 @@ async def run_gaia_benchmark():
             with open(output_path, "w") as f:
                 json.dump(task_result, f, indent=2)
             
+            # Print the task result with clear formatting
+            print("\n" + "="*80)
+            print(f"TASK RESULTS: {task_id}")
+            print("="*80)
+            print(f"STATUS: {'✅ CORRECT' if is_correct else '❌ INCORRECT'}")
+            print("-"*80)
+            print("QUESTION:")
+            print(f"{question}")
+            print("-"*80)
+            print("EXPECTED ANSWER:")
+            print(f"{true_answer}")
+            print("-"*80)
+            print("AGENT'S ANSWER:")
+            print(f"{result}")
+            print("-"*80)
+            if is_correct:
+                print("EXPLANATION: The agent's answer correctly matches the expected answer.")
+            else:
+                print("EXPLANATION: The agent's answer does not match the expected answer.")
+                # Add more detail about the mismatch
+                if true_answer.lower() in result.lower():
+                    print("NOTE: The expected answer is contained in the agent's answer but in a different format.")
+            print("-"*80)
+            print(f"Number of steps: {len(agent.memory.steps) if hasattr(agent, 'memory') and hasattr(agent.memory, 'steps') else 0}")
+            print(f"Results saved to: {output_path}")
+            print("="*80)
+            
             logger.info(f"Task {task_id} completed: {'✓ Correct' if is_correct else '✗ Incorrect'}")
-            logger.info(f"Results saved to: {output_path}")
             
         except Exception as e:
             logger.error(f"Error processing task {task_id}: {e}")
@@ -430,7 +456,46 @@ async def run_gaia_benchmark():
     total_count = len(results)
     accuracy = correct_count / total_count if total_count > 0 else 0
     
-    logger.info(f"Benchmark complete: {correct_count}/{total_count} correct ({accuracy:.2%} accuracy)")
+    # Print a clear summary of all results
+    print("\n" + "="*80)
+    print("BENCHMARK SUMMARY")
+    print("="*80)
+    print(f"Total tasks: {total_count}")
+    print(f"Correct: {correct_count}")
+    print(f"Incorrect: {total_count - correct_count}")
+    print(f"Accuracy: {accuracy:.2%}")
+    print("-"*80)
+    print("Tasks by ID:")
+    
+    # Group results by task type/level if available
+    task_types = {}
+    for result in results:
+        task_id = result["task_id"]
+        is_correct = result["correct"]
+        task_type = task_id.split("_")[0] if "_" in task_id else "Unknown"
+        
+        if task_type not in task_types:
+            task_types[task_type] = {"correct": 0, "total": 0}
+        
+        task_types[task_type]["total"] += 1
+        if is_correct:
+            task_types[task_type]["correct"] += 1
+            
+        # Print each task result with an emoji indicator
+        print(f"  {'✅' if is_correct else '❌'} {task_id}")
+    
+    # Print breakdown by task type
+    if len(task_types) > 1:
+        print("-"*80)
+        print("Results by category:")
+        for task_type, counts in task_types.items():
+            type_accuracy = counts["correct"] / counts["total"] if counts["total"] > 0 else 0
+            print(f"  {task_type}: {counts['correct']}/{counts['total']} ({type_accuracy:.2%})")
+    
+    print("="*80)
+    print(f"Benchmark complete: {correct_count}/{total_count} correct ({accuracy:.2%} accuracy)")
+    print(f"Detailed results saved to: {output_path}")
+    print("="*80)
     
     return results
 
