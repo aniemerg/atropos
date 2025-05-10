@@ -494,13 +494,19 @@ def run_task(args, task, model):
             logger.error(f"Error getting agent memory: {memory_e}")
             agent_memory = []
         
-        # Evaluate the result
-        # Try more flexible matching since formats might differ slightly
-        # First, check for strict containment
-        is_correct = task["true_answer"].lower() in result.lower()
+        # Import the GAIA scoring functions
+        from environments.smolagents_integration.gaia_scorer import (
+            question_scorer, check_close_call, normalize_str, is_float
+        )
         
-        # If not correct, try stripping whitespace and checking function bodies
-        if not is_correct:
+        # First, use the advanced question_scorer for primary correctness check
+        is_correct = question_scorer(result, task["true_answer"])
+        
+        # If not strictly correct, check for near-correct answers
+        is_near_correct = check_close_call(result, task["true_answer"], is_correct)
+        
+        # For code answers, also try additional normalization if still not correct
+        if not is_correct and task["true_answer"].strip().startswith(("def ", "class ", "function", "```")):
             import re
             
             # Extract function body from both expected and actual
@@ -508,14 +514,22 @@ def run_task(args, task, model):
                 # Remove whitespace and comments
                 code_str = re.sub(r'\s+', '', code_str)
                 code_str = re.sub(r'#.*', '', code_str)
-                return code_str
+                # Remove markdown code blocks
+                code_str = re.sub(r'```\w*', '', code_str)
+                code_str = re.sub(r'```', '', code_str)
+                return code_str.lower()
             
             # Try to extract logical parts and compare
             expected_normalized = normalize_code(task["true_answer"])
             result_normalized = normalize_code(result)
             
             # Check if the normalized result contains the normalized expected answer
-            is_correct = expected_normalized in result_normalized
+            is_code_correct = expected_normalized in result_normalized
+            
+            # Update correctness if code matching succeeded
+            if is_code_correct:
+                is_correct = True
+                is_near_correct = True
         
         # Prepare results
         execution_result = {
@@ -524,8 +538,15 @@ def run_task(args, task, model):
             "true_answer": task["true_answer"],
             "prediction": result,
             "correct": is_correct,
+            "near_correct": is_near_correct and not is_correct,  # Only true if near but not exact
             "agent_memory": agent_memory,
             "num_steps": len(agent.memory.steps) if hasattr(agent, 'memory') and hasattr(agent.memory, 'steps') else 0,
+            "evaluation_details": {
+                "evaluation_method": "question_scorer",
+                "code_normalized": task["true_answer"].strip().startswith(("def ", "class ", "function", "```")),
+                "is_float_comparison": is_float(task["true_answer"]) if 'is_float' in globals() else False,
+                "is_list_comparison": any(char in task["true_answer"] for char in [",", ";"]),
+            }
         }
         
         return execution_result
@@ -596,7 +617,20 @@ async def main():
     print("\n" + "="*80)
     print(f"TASK RESULTS: {args.task_id}")
     print("="*80)
-    print(f"STATUS: {'✅ CORRECT' if result['correct'] else '❌ INCORRECT'}")
+    
+    # Determine status with 3-way classification
+    if result['correct']:
+        status = "✅ CORRECT"
+        status_color = "\033[92m"  # Green
+    elif result.get('near_correct', False):
+        status = "🔶 NEAR CORRECT"
+        status_color = "\033[93m"  # Yellow
+    else:
+        status = "❌ INCORRECT"
+        status_color = "\033[91m"  # Red
+    
+    # Print status with color
+    print(f"STATUS: {status_color}{status}\033[0m")
     print("-"*80)
     print("QUESTION:")
     print(f"{task['question']}")
@@ -607,13 +641,48 @@ async def main():
     print("AGENT'S ANSWER:")
     print(f"{result['prediction']}")
     print("-"*80)
+    
+    # Detailed explanation based on answer type
+    print("EVALUATION DETAILS:")
     if result['correct']:
-        print("EXPLANATION: The agent's answer correctly matches the expected answer.")
+        print("✅ The agent's answer is correct!")
+        
+        # Explain what type of matching succeeded
+        if result.get('evaluation_details', {}).get('is_float_comparison', False):
+            print("   (Evaluated as a numerical answer)")
+        elif result.get('evaluation_details', {}).get('is_list_comparison', False):
+            print("   (Evaluated as a list of items)")
+        elif result.get('evaluation_details', {}).get('code_normalized', False):
+            print("   (Evaluated as code with normalization)")
+        else:
+            print("   (Evaluated as text with normalization)")
+            
+    elif result.get('near_correct', False):
+        print("🔶 The agent's answer is nearly correct.")
+        print("   The answer contains the key components but may have formatting differences.")
+        
+        # Add specific details based on answer type
+        if result.get('evaluation_details', {}).get('is_float_comparison', False):
+            print("   (Numerical answer is close but not exact)")
+        elif result.get('evaluation_details', {}).get('is_list_comparison', False):
+            print("   (List items are partially matched)")
+        elif result.get('evaluation_details', {}).get('code_normalized', False):
+            print("   (Code logic is similar but not exactly matching)")
+        else:
+            print("   (Text contains required elements in order but with differences)")
     else:
-        print("EXPLANATION: The agent's answer does not match the expected answer.")
-        # Add more detail about the mismatch
-        if task['true_answer'].lower() in result['prediction'].lower():
-            print("NOTE: The expected answer is contained in the agent's answer but in a different format.")
+        print("❌ The agent's answer is incorrect.")
+        
+        # Try to explain why it might be wrong
+        if result.get('evaluation_details', {}).get('is_float_comparison', False):
+            print("   (Numerical values do not match)")
+        elif result.get('evaluation_details', {}).get('is_list_comparison', False):
+            print("   (List items do not match)")
+        elif result.get('evaluation_details', {}).get('code_normalized', False):
+            print("   (Code logic does not match the expected solution)")
+        else:
+            print("   (Text does not match the expected answer)")
+    
     print("-"*80)
     print(f"Number of steps: {result['num_steps']}")
     print(f"Results saved to: {output_path}")

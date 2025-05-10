@@ -386,12 +386,47 @@ async def run_gaia_benchmark():
                             logger.error(f"Error getting agent memory: {memory_e}")
                             agent_memory = []
                         
-                        # Evaluate the result
-                        is_correct = true_answer.lower() in result.lower()
+                        # Import the GAIA scoring functions
+                        from environments.smolagents_integration.gaia_scorer import (
+                            question_scorer, check_close_call, normalize_str, is_float
+                        )
+                        
+                        # First, use the advanced question_scorer for primary correctness check
+                        is_correct = question_scorer(result, true_answer)
+                        
+                        # If not strictly correct, check for near-correct answers
+                        is_near_correct = check_close_call(result, true_answer, is_correct)
+                        
+                        # For code answers, also try additional normalization if still not correct
+                        if not is_correct and true_answer.strip().startswith(("def ", "class ", "function", "```")):
+                            import re
+                            
+                            # Extract function body from both expected and actual
+                            def normalize_code(code_str):
+                                # Remove whitespace and comments
+                                code_str = re.sub(r'\s+', '', code_str)
+                                code_str = re.sub(r'#.*', '', code_str)
+                                # Remove markdown code blocks
+                                code_str = re.sub(r'```\w*', '', code_str)
+                                code_str = re.sub(r'```', '', code_str)
+                                return code_str.lower()
+                            
+                            # Try to extract logical parts and compare
+                            expected_normalized = normalize_code(true_answer)
+                            result_normalized = normalize_code(result)
+                            
+                            # Check if the normalized result contains the normalized expected answer
+                            is_code_correct = expected_normalized in result_normalized
+                            
+                            # Update correctness if code matching succeeded
+                            if is_code_correct:
+                                is_correct = True
+                                is_near_correct = True
                 else:
                     result = "No result from agent"
                     agent_memory = []
                     is_correct = False
+                    is_near_correct = False
             
             # Save the result
             task_result = {
