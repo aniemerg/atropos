@@ -24,7 +24,7 @@ from atroposlib.envs.base import BaseEnv, BaseEnvConfig, Item, ScoredDataGroup
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig, OpenAIServer
 from atroposlib.envs.server_handling.server_manager import ServerManager
 from environments.smolagents_integration.atropos_smolagents_integration import AtroposServerModel
-from environments.smolagents_integration.tools.file_tools import create_file_reader_tool
+from environments.smolagents_integration.tools.file_tools import read_file, write_file, append_to_file
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -47,8 +47,8 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default=12, description="Maximum number of agent steps"
     )
     tools_enabled: List[str] = Field(
-        default=["python", "file_reader", "web_search"], 
-        description="Enabled tools"
+        default=["python", "file_reader", "file_writer", "web_search"], 
+        description="Enabled tools (python, file_reader, file_writer, web_search)"
     )
     agent_verbosity: int = Field(
         default=2, description="Agent verbosity level (0-3)"
@@ -253,10 +253,15 @@ class SmolagentsEnv(BaseEnv):
                 )
             )
         
-        # Add file reader tool
+        # Add file reader tool - use the existing tools from file_tools.py
         if "file_reader" in self.tools_enabled:
-            file_reader_tool = create_file_reader_tool()
-            tools.append(file_reader_tool)
+            # Add the read_file tool
+            tools.append(read_file)
+            
+            # Optionally add write and append tools
+            if "file_writer" in self.tools_enabled:
+                tools.append(write_file)
+                tools.append(append_to_file)
         
         # Add web search tool if enabled
         if "web_search" in self.tools_enabled:
