@@ -327,12 +327,70 @@ class SmolagentsEnv(BaseEnv):
         # Process results
         backlog = []
         to_postprocess = []
-        for result in results:
+        
+        logger.info(f"Got {len(results)} results from agent executions")
+        
+        for i, result in enumerate(results):
+            logger.info(f"Result {i}: type={type(result)}, is_none={result[0] is None}, backlog_len={len(result[1])}")
             if result[0] is not None:
                 to_postprocess.append(result[0])
+                logger.info(f"  Added result to to_postprocess: {type(result[0])}")
+            else:
+                logger.warning(f"  Skipping None result at index {i}")
             backlog.extend(result[1])
         
+        logger.info(f"Final to_postprocess: type={type(to_postprocess)}, len={len(to_postprocess)}")
+        logger.info(f"Final backlog: type={type(backlog)}, len={len(backlog)}")
+        
         return to_postprocess, backlog
+        
+    async def postprocess_histories(
+        self, histories: Union[ScoredDataGroup, List[ScoredDataGroup]]
+    ) -> ScoredDataGroup:
+        """
+        Post-process the agent histories.
+        
+        We need to merge multiple ScoredDataGroups into a single ScoredDataGroup.
+        """
+        logger.info(f"postprocess_histories called with: type={type(histories)}, is_none={histories is None}")
+        if isinstance(histories, list):
+            logger.info(f"  List length: {len(histories)}")
+            
+        if not isinstance(histories, list):
+            # If it's already a single ScoredDataGroup, return it with group_overrides
+            logger.info(f"  Single history, returning directly: {type(histories)}")
+            if "group_overrides" not in histories or histories["group_overrides"] is None:
+                histories["group_overrides"] = {}
+            return histories
+            
+        # If we have multiple ScoredDataGroups, merge them
+        logger.info(f"  Merging {len(histories)} histories")
+        merged = ScoredDataGroup(
+            tokens=[],
+            masks=[],
+            scores=[],
+            advantages=None,
+            ref_logprobs=None,
+            messages=[] if self.config.include_messages else None,
+            group_overrides={},
+            overrides=None
+        )
+        
+        # Merge all the fields
+        for i, history in enumerate(histories):
+            logger.info(f"  Processing history {i}: type={type(history)}, is_none={history is None}")
+            if history is not None:
+                logger.info(f"    History {i} tokens: {len(history['tokens'])}")
+                merged["tokens"].extend(history["tokens"])
+                merged["masks"].extend(history["masks"])
+                merged["scores"].extend(history["scores"])
+                
+                if merged["messages"] is not None and "messages" in history:
+                    logger.info(f"    History {i} messages: {len(history['messages'])}")
+                    merged["messages"].extend(history["messages"])
+        
+        logger.info(f"  Final merged data: tokens={len(merged['tokens'])}, scores={len(merged['scores'])}")
+        return merged
     
     async def collect_trajectory(self, item: Item) -> Tuple[Any, List[Item]]:
         """
