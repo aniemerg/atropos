@@ -15,20 +15,37 @@ import numpy as np
 import wandb
 from pydantic import BaseModel, Field
 from smolagents import CodeAgent, Tool
+from smolagents.tools import tool  # Import the tool decorator
 
 # Apply the patched AsyncBridge early to ensure all calls use the enhanced version
 from environments.smolagents_integration.patched_async_bridge import patch_asyncbridge
 patch_asyncbridge()  # Must be called before any imports that use AsyncBridge
 
-from atroposlib.envs.base import BaseEnv, BaseEnvConfig, Item, ScoredDataGroup
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+
+from atroposlib.envs.base import BaseEnv, BaseEnvConfig, ScoredDataGroup
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig, OpenAIServer
 from atroposlib.envs.server_handling.server_manager import ServerManager
 from environments.smolagents_integration.atropos_smolagents_integration import AtroposServerModel
 from environments.smolagents_integration.tools.file_tools import read_file, write_file, append_to_file
 
+@dataclass
+class Item:
+    prompt: str
+    metadata: Dict[str, Any]
+    id: Optional[str] = None
+
 # Configure logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+# Add a console handler to make sure logs are visible
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 
 class SmolagentsEnvConfig(BaseEnvConfig):
@@ -38,7 +55,7 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default="data/gaia", description="Path to GAIA dataset"
     )
     split: str = Field(
-        default="train", description="Dataset split to use (train, validation, test)"
+        default="validation", description="Dataset split to use (validation, test)"
     )
     use_chat_completion: bool = Field(
         default=True, description="Use chat completion API"
@@ -47,8 +64,8 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default=12, description="Maximum number of agent steps"
     )
     tools_enabled: List[str] = Field(
-        default=["python", "file_reader", "file_writer", "web_search"], 
-        description="Enabled tools (python, file_reader, file_writer, web_search)"
+        default=["file_reader", "file_writer", "web_search"], 
+        description="Enabled tools (file_reader, file_writer, web_search)"
     )
     agent_verbosity: int = Field(
         default=2, description="Agent verbosity level (0-3)"
@@ -151,6 +168,7 @@ class SmolagentsEnv(BaseEnv):
     async def setup(self):
         """Set up the environment, load dataset, and initialize agent components."""
         logger.info("Setting up SmolagentsEnv...")
+        logger.info(f"Using dataset split: {self.config.split}")
         
         # Create a semaphore to limit concurrent agent executions
         self.agent_semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
@@ -214,65 +232,40 @@ class SmolagentsEnv(BaseEnv):
     def _create_tools(self) -> List[Tool]:
         """Create and return the tools for the CodeAgent based on config."""
         tools = []
+        logger.info("Creating tools for CodeAgent")
         
-        # Add Python executor
-        if "python" in self.tools_enabled:
-            def execute_python(code: str) -> str:
-                """Execute Python code and return the result."""
-                try:
-                    import traceback
-                    from io import StringIO
-                    import sys
-                    
-                    # Capture stdout
-                    original_stdout = sys.stdout
-                    sys.stdout = StringIO()
-                    
-                    try:
-                        # Execute the code
-                        exec(code, {})
-                        output = sys.stdout.getvalue()
-                        return output if output.strip() else "Code executed successfully with no output."
-                    except Exception as e:
-                        # Return the error message and traceback
-                        return f"Error: {str(e)}\n{traceback.format_exc()}"
-                    finally:
-                        # Restore stdout
-                        sys.stdout = original_stdout
-                except Exception as e:
-                    return f"Error setting up Python execution: {str(e)}"
-            
-            tools.append(
-                Tool(
-                    name="python",
-                    description="Execute Python code and return the result.",
-                    inputs={
-                        "code": {"type": "string", "description": "Python code to execute"}
-                    },
-                    function=execute_python,
-                )
-            )
+        # Always add file tools (read, write, append)
+        # These use the @tool decorator and are correctly formed SimpleTool instances
+        tools.append(read_file)
+        tools.append(write_file)
+        tools.append(append_to_file)
+        logger.info("Added file tools (read_file, write_file, append_to_file)")
         
-        # Add file reader tool - use the existing tools from file_tools.py
-        if "file_reader" in self.tools_enabled:
-            # Add the read_file tool
-            tools.append(read_file)
-            
-            # Optionally add write and append tools
-            if "file_writer" in self.tools_enabled:
-                tools.append(write_file)
-                tools.append(append_to_file)
+        # Add web search tool if TAVILY_API_KEY is available
+        try:
+            from environments.smolagents_integration.tools.tavily_tools import TavilySearchTool, TavilyExtractTool
+            if os.environ.get("TAVILY_API_KEY"):
+                tavily_search = TavilySearchTool(api_key=os.environ.get("TAVILY_API_KEY"))
+                tavily_extract =  TavilyExtractTool(api_key=os.environ.get("TAVILY_API_KEY"))
+                tools.append(tavily_search)
+                tools.append(tavily_extract)
+                logger.info("Added web_search tool")
+            else:
+                logger.warning("TAVILY_API_KEY not set in environment, web search disabled")
+        except Exception as e:
+            logger.warning(f"Could not create web search tool: {e}")
         
-        # Add web search tool if enabled
-        if "web_search" in self.tools_enabled:
-            try:
-                from environments.smolagents_integration.tools.tavily_tools import create_tavily_search_tool
-                tavily_tool = create_tavily_search_tool()
-                tools.append(tavily_tool)
-            except Exception as e:
-                logger.warning(f"Could not create web search tool: {e}")
+        # Log tool info for debugging
+        tool_names = []
+        for i, tool in enumerate(tools):
+            if hasattr(tool, 'name'):
+                tool_names.append(tool.name)
+                logger.info(f"Tool {i} name: {tool.name}")
+            else:
+                tool_names.append(str(tool))
+                logger.warning(f"Tool {i} has no name attribute: {tool}")
         
-        logger.info(f"Created {len(tools)} tools for CodeAgent: {[t.name for t in tools]}")
+        logger.info(f"Created {len(tools)} tools for CodeAgent: {tool_names}")
         return tools
     
     async def get_next_item(self) -> Item:
