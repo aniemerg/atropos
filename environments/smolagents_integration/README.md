@@ -1,6 +1,6 @@
 # Atropos-SmolaGents Integration
 
-This integration enables the use of SmolaGents' agent capabilities with Atropos' server-based LLM architecture for benchmarking with the GAIA benchmark.
+This integration enables the use of SmolaGents' agent capabilities with Atropos' server-based LLM architecture for both GAIA benchmark evaluation and high-quality training data generation.
 
 ## Overview
 
@@ -8,13 +8,16 @@ The integration consists of:
 
 1. **AtroposServerModel**: A SmolaGents Model implementation that wraps Atropos servers.
 2. **Tools**: File manipulation and web searching tools for the agent to use.
-3. **GAIABenchmarkEnv**: An Atropos environment that uses SmolaGents' CodeAgent with the Atropos server.
-4. **Scripts** for running the GAIA benchmark with the integration.
+3. **GAIABenchmarkEnv**: An Atropos environment for running GAIA benchmark evaluations.
+4. **SmolagentsEnv**: A full-fledged Atropos environment for generating high-quality agent trajectories.
+5. **Scripts** for running the GAIA benchmark with the integration.
 
 ## Files
 
 - `atropos_smolagents_integration.py`: Contains the `AtroposServerModel` class that acts as a bridge between SmolaGents and Atropos.
 - `gaia_benchmark_env.py`: The Atropos environment for running GAIA benchmark evaluations.
+- `smolagents_env.py`: The complete Atropos environment for generating training data.
+- `patched_async_bridge.py`: Enhanced AsyncBridge with better error handling and debugging.
 - `run_gaia_benchmark.py`: Script for running the GAIA benchmark with the integrated system.
 - `run_gaia_single_task.py`: Script for running a single GAIA benchmark task with detailed output.
 - `tools/`: Directory containing implementations of tools:
@@ -51,6 +54,43 @@ If you need to use a different API key per run, you can also provide them as com
 
 ## Using the Integration
 
+### Using SmolagentsEnv for Training Data Generation
+
+Generate SFT training data with the following command:
+
+```bash
+atropos-sft-gen output.jsonl --tokenizer NousResearch/DeepHermes-3-Llama-3-8B-Preview \
+  --save-messages --env smolagents
+```
+
+For local testing without connecting to the API server:
+
+```bash
+python -m environments.smolagents_integration.smolagents_env process \
+  --env_data_path_to_save_groups output.jsonl \
+  --env_total_steps 10 \
+  --env_group_size 2 \
+  --env_include_messages true \
+  --env_max_concurrent_agents 4 \
+  --env_use_chat_completion true \
+  --openai_model_name "gpt-4o" \
+  --openai_base_url "https://api.openai.com/v1" \
+  --openai_api_key "$OPENAI_API_KEY"
+```
+
+To serve the environment for a trainer:
+
+```bash
+python -m environments.smolagents_integration.smolagents_env serve \
+  --env_rollout_server_url "http://localhost:8000" \
+  --env_use_chat_completion true \
+  --env_max_concurrent_agents 5 \
+  --env_group_size 8 \
+  --openai_model_name "gpt-4o" \
+  --openai_base_url "https://api.openai.com/v1" \
+  --openai_api_key "$OPENAI_API_KEY"
+```
+
 ### Running a Single GAIA Task
 
 To run a single task from the GAIA benchmark:
@@ -85,6 +125,40 @@ Options:
 - `--use-wandb`: Enable wandb logging.
 
 ## How It Works
+
+### SmolagentsEnv
+
+The `SmolagentsEnv` class provides a complete environment for generating high-quality agent trajectories:
+
+1. Loads tasks from the GAIA benchmark dataset
+2. Creates an AtroposServerModel wrapping Atropos servers
+3. Initializes a CodeAgent with configurable tools
+4. Manages agent execution and trajectory collection
+5. Scores trajectories based on correctness, efficiency, and reasoning quality
+6. Integrates with Atropos SFT generation pipeline
+
+Configuration options for `SmolagentsEnv`:
+
+```python
+class SmolagentsEnvConfig(BaseEnvConfig):
+    dataset_path: str = Field(default="data/gaia", description="Path to GAIA dataset")
+    split: str = Field(default="train", description="Dataset split to use")
+    use_chat_completion: bool = Field(default=True, description="Use chat completion API")
+    max_steps: int = Field(default=12, description="Maximum number of agent steps")
+    tools_enabled: List[str] = Field(
+        default=["python", "file_reader", "web_search"], 
+        description="Enabled tools"
+    )
+    agent_verbosity: int = Field(default=2, description="Agent verbosity level")
+    scoring_strategy: str = Field(
+        default="combined", 
+        description="Scoring strategy: basic, correctness, or combined"
+    )
+    bridge_timeout_factor: float = Field(default=1.5, description="Safety factor for AsyncBridge timeouts")
+    max_concurrent_agents: int = Field(default=5, description="Maximum concurrent agent executions")
+    length_penalty_weight: float = Field(default=0.1, description="Weight for length penalty in scoring")
+    save_full_traces: bool = Field(default=True, description="Save full agent execution traces")
+```
 
 ### AtroposServerModel
 
@@ -178,12 +252,14 @@ result = agent.run("Your prompt here")
 
 ## Troubleshooting
 
-- **Async/Sync issues**: If you encounter async-related errors, make sure you're correctly bridging the async/sync boundary.
+- **Async/Sync issues**: If you encounter async-related errors, make sure you're correctly bridging the async/sync boundary. The `patched_async_bridge.py` provides enhanced error reporting and timeout handling.
 - **Message format errors**: Check that message conversions between SmolaGents and Atropos formats are correct.
 - **Missing GAIA data**: Make sure you've downloaded the GAIA benchmark data correctly.
 - **Web tool errors**: If Tavily tools aren't working, make sure you have set the `TAVILY_API_KEY` environment variable and have installed the `tavily-python` package.
 - **Tool import errors**: If you see errors about missing tool modules, ensure your working directory allows proper imports of the tools folder.
 - **Permission errors with file tools**: Ensure your process has the correct permissions to read/write files in the directories being accessed.
+- **Semaphore limitation**: If many agent runs are timing out, try lowering the `max_concurrent_agents` parameter in SmolagentsEnv.
+- **Memory issues**: If you encounter memory leaks, ensure that AsyncBridge cleanup is being called during environment shutdown.
 
 ## Contributing
 
