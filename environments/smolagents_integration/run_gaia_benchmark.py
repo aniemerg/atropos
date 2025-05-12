@@ -395,10 +395,20 @@ async def run_gaia_benchmark():
                         is_correct = question_scorer(result, true_answer)
                         
                         # If not strictly correct, check for near-correct answers
-                        is_near_correct = check_close_call(result, true_answer, is_correct)
+                        # Handle potential type issues - ensure we're working with strings for string operations
+                        try:
+                            # Need to handle numeric answers properly - if numerical, don't do near-correct check
+                            if is_float(true_answer):
+                                is_near_correct = False  # For numerical answers, we don't have "near correct"
+                            else:
+                                is_near_correct = check_close_call(str(result), str(true_answer), is_correct)
+                        except Exception as e:
+                            logger.warning(f"Error in near-correct check: {e}")
+                            is_near_correct = False
                         
                         # For code answers, also try additional normalization if still not correct
-                        if not is_correct and true_answer.strip().startswith(("def ", "class ", "function", "```")):
+                        # First check that we're not dealing with a numeric answer
+                        if not is_correct and not is_float(true_answer) and str(true_answer).strip().startswith(("def ", "class ", "function", "```")):
                             import re
                             
                             # Extract function body from both expected and actual
