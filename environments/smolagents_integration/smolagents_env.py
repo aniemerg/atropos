@@ -135,8 +135,9 @@ class SmolagentsEnv(BaseEnv):
             max_concurrent_agents=5,
             # Common settings
             dataset_path="data/gaia",
-            split="train",
+            split="validation",  # GAIA only supports 'validation' and 'test' splits
             use_chat_completion=True,
+            data_path_to_save_groups="output.jsonl",  # Default output file path
         )
         server_configs = [
             OpenaiConfig(
