@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+import multiprocessing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -17,17 +18,14 @@ from pydantic import BaseModel, Field
 from smolagents import CodeAgent, Tool
 from smolagents.tools import tool  # Import the tool decorator
 
-# Apply the patched AsyncBridge early to ensure all calls use the enhanced version
-from environments.smolagents_integration.patched_async_bridge import patch_asyncbridge
-patch_asyncbridge()  # Must be called before any imports that use AsyncBridge
-
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 
 from atroposlib.envs.base import BaseEnv, BaseEnvConfig, ScoredDataGroup
 from atroposlib.envs.server_handling.openai_server import OpenaiConfig, OpenAIServer
 from atroposlib.envs.server_handling.server_manager import ServerManager
-from environments.smolagents_integration.atropos_smolagents_integration import AtroposServerModel
+from environments.smolagents_integration.server_proxy import ServerProxyManager
+from environments.smolagents_integration.agent_process_runner import run_agent_process
 from environments.smolagents_integration.tools.file_tools import read_file, write_file, append_to_file
 
 @dataclass
@@ -74,10 +72,6 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default="combined", 
         description="Scoring strategy: basic, correctness, or combined"
     )
-    bridge_timeout_factor: float = Field(
-        default=1.5, 
-        description="Safety factor for AsyncBridge timeouts"
-    )
     max_concurrent_agents: int = Field(
         default=5, 
         description="Maximum concurrent agent executions"
@@ -89,6 +83,19 @@ class SmolagentsEnvConfig(BaseEnvConfig):
     save_full_traces: bool = Field(
         default=True,
         description="Save full agent execution traces in the output"
+    )
+    # New process-based settings
+    max_concurrent_processes: int = Field(
+        default=5,
+        description="Maximum number of concurrent processes for agent execution"
+    )
+    process_timeout: int = Field(
+        default=240,  # 4 minutes by default
+        description="Timeout for agent processes in seconds"
+    )
+    use_process_isolation: bool = Field(
+        default=True,
+        description="Whether to use process-based isolation for agent execution"
     )
 
 
@@ -120,7 +127,13 @@ class SmolagentsEnv(BaseEnv):
             max_token_length=4096,
             wandb_name="smolagents",
             include_messages=True,
+            # Process-based settings
+            use_process_isolation=True,
+            max_concurrent_processes=8,
+            process_timeout=240,
+            # Legacy settings (used only if use_process_isolation=False)
             max_concurrent_agents=5,
+            # Common settings
             dataset_path="data/gaia",
             split="train",
             use_chat_completion=True,
@@ -149,6 +162,11 @@ class SmolagentsEnv(BaseEnv):
         self.examples = []
         self.current_index = 0
         self.iter = 0  # Add iter for checkpoint tracking
+        
+        # Initialize the server proxy manager for process-based execution
+        self.server_proxy_manager = None  # Will be initialized in setup()
+        
+        # For legacy mode (when not using process isolation)
         self.agent = None
         self.model = None
         self.tools = []
@@ -159,6 +177,7 @@ class SmolagentsEnv(BaseEnv):
         self.tools_enabled = config.tools_enabled
         self.verbosity = config.agent_verbosity
         self.scoring_strategy = config.scoring_strategy
+        self.use_process_isolation = config.use_process_isolation
         
         # Track agent execution times and metrics
         self.agent_execution_times = []
@@ -166,12 +185,49 @@ class SmolagentsEnv(BaseEnv):
         self.eval_metrics = []
         
     async def setup(self):
-        """Set up the environment, load dataset, and initialize agent components."""
+        """Set up the environment, load dataset, and initialize server components."""
         logger.info("Setting up SmolagentsEnv...")
         logger.info(f"Using dataset split: {self.config.split}")
         
-        # Create a semaphore to limit concurrent agent executions
-        self.agent_semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
+        # Initialize the appropriate execution mechanism based on configuration
+        if self.use_process_isolation:
+            logger.info("Using process-based isolation for agent execution")
+            
+            # Initialize the server proxy manager
+            self.server_proxy_manager = ServerProxyManager(
+                server=self.server,
+                max_workers=self.config.max_concurrent_processes
+            )
+            self.server_proxy_manager.start()
+            logger.info(f"Started server proxy manager with max_workers={self.config.max_concurrent_processes}")
+        else:
+            logger.info("Using thread-based agent execution (legacy mode)")
+            
+            # Create a semaphore to limit concurrent agent executions
+            self.agent_semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
+            
+            # Create AtroposServerModel wrapper for legacy mode
+            self.model = AtroposServerModel(
+                server=self.server,
+                use_chat_completion=self.config.use_chat_completion,
+                model_id="atropos-smolagents",
+            )
+            
+            # Create tools for the agent in legacy mode
+            self.tools = self._create_tools()
+            
+            # Initialize the CodeAgent with our tools and model
+            self.agent = CodeAgent(
+                tools=self.tools,
+                model=self.model,
+                max_steps=self.max_steps,
+                additional_authorized_imports=["*"],  # Allow all imports for flexibility
+                verbosity_level=self.verbosity,
+            )
+            
+            from environments.smolagents_integration.patched_async_bridge import patch_asyncbridge
+            patch_asyncbridge()  # Patch AsyncBridge for legacy mode
+            logger.info("Patched AsyncBridge for legacy mode execution")
         
         # Load the GAIA dataset
         try:
@@ -207,25 +263,6 @@ class SmolagentsEnv(BaseEnv):
             logger.error(f"Error loading GAIA dataset: {e}")
             # Create empty list if dataset loading fails
             self.examples = []
-        
-        # Create AtroposServerModel wrapper
-        self.model = AtroposServerModel(
-            server=self.server,
-            use_chat_completion=self.config.use_chat_completion,
-            model_id="atropos-smolagents",
-        )
-        
-        # Create tools for the agent
-        self.tools = self._create_tools()
-        
-        # Initialize the CodeAgent with our tools and model
-        self.agent = CodeAgent(
-            tools=self.tools,
-            model=self.model,
-            max_steps=self.max_steps,
-            additional_authorized_imports=["*"],  # Allow all imports for flexibility
-            verbosity_level=self.verbosity,
-        )
         
         logger.info("SmolagentsEnv setup complete")
     
@@ -301,7 +338,7 @@ class SmolagentsEnv(BaseEnv):
         return item
     
     async def _collect_with_semaphore(self, semaphore, item: Item) -> Tuple[Any, List[Item]]:
-        """Run agent with semaphore to limit concurrency."""
+        """Run agent with semaphore to limit concurrency (legacy mode)."""
         async with semaphore:
             return await self.collect_trajectory(item)
     
@@ -310,12 +347,21 @@ class SmolagentsEnv(BaseEnv):
         List[Item],
     ]:
         """
-        Collect trajectories for multiple items with concurrency control.
+        Collect trajectories for multiple items using either process-based or legacy concurrency control.
         """
         # Handle both single item and list of items
         if not isinstance(items, list):
             items = [items] * self.config.group_size
         
+        if self.use_process_isolation:
+            # Use process-based isolation
+            return await self._collect_trajectories_process_based(items)
+        else:
+            # Use legacy semaphore-based approach
+            return await self._collect_trajectories_legacy(items)
+    
+    async def _collect_trajectories_legacy(self, items: List[Item]) -> Tuple[List[Any], List[Item]]:
+        """Legacy approach using semaphores and AsyncBridge."""
         # Create tasks with semaphore to limit concurrency
         tasks = []
         for item in items:
@@ -328,7 +374,7 @@ class SmolagentsEnv(BaseEnv):
         backlog = []
         to_postprocess = []
         
-        logger.info(f"Got {len(results)} results from agent executions")
+        logger.info(f"Got {len(results)} results from agent executions (legacy mode)")
         
         for i, result in enumerate(results):
             logger.info(f"Result {i}: type={type(result)}, is_none={result[0] is None}, backlog_len={len(result[1])}")
@@ -342,6 +388,135 @@ class SmolagentsEnv(BaseEnv):
         logger.info(f"Final to_postprocess: type={type(to_postprocess)}, len={len(to_postprocess)}")
         logger.info(f"Final backlog: type={type(backlog)}, len={len(backlog)}")
         
+        return to_postprocess, backlog
+    
+    async def _collect_trajectories_process_based(self, items: List[Item]) -> Tuple[List[Any], List[Item]]:
+        """
+        Collect trajectories for multiple items using process-based parallelism.
+        """
+        logger.info(f"Collecting trajectories for {len(items)} items using process-based parallelism")
+        
+        # Create a manager for shared objects
+        manager = multiprocessing.Manager()
+        result_queue = manager.Queue()
+        
+        # Create agent config dictionary
+        agent_config = {
+            "max_steps": self.max_steps,
+            "verbosity": self.verbosity,
+            "use_chat_completion": self.config.use_chat_completion,
+            "model_name": getattr(self.server, "model_name", "unknown-model")
+        }
+        
+        # Start processes for each item
+        processes = []
+        proxies = []
+        
+        for item in items:
+            # Create a server proxy for this process
+            server_proxy, proxy_id = self.server_proxy_manager.create_server_proxy(
+                model_name=agent_config["model_name"],
+                timeout=self.config.process_timeout
+            )
+            proxies.append(proxy_id)
+            
+            # Start a process for this item
+            process = multiprocessing.Process(
+                target=run_agent_process,
+                args=(
+                    item.prompt,
+                    item.metadata,
+                    server_proxy,
+                    agent_config,
+                    result_queue
+                )
+            )
+            process.start()
+            processes.append(process)
+        
+        logger.info(f"Started {len(processes)} agent processes")
+        
+        # Wait for all processes to complete or timeout
+        for process in processes:
+            process.join(timeout=self.config.process_timeout)
+            
+            # Check if process is still alive (timeout)
+            if process.is_alive():
+                logger.warning(f"Process {process.pid} timed out, terminating")
+                process.terminate()
+                process.join()
+        
+        # Clean up proxies
+        for proxy_id in proxies:
+            self.server_proxy_manager.remove_proxy(proxy_id)
+        
+        # Get all results from the queue
+        results = []
+        while not result_queue.empty():
+            try:
+                result = result_queue.get(block=False)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error getting result from queue: {e}")
+                break
+        
+        logger.info(f"Collected {len(results)} results from processes")
+        
+        # Process results
+        backlog = []
+        to_postprocess = []
+        
+        for result in results:
+            if result["status"] == "success":
+                # Create scored data from successful result
+                scored_data = {
+                    "prompt": result["task_metadata"].get("prompt", ""),
+                    "response": result["response"],
+                    "task_id": result["task_id"],
+                    "task": result["task_metadata"].get("task", ""),
+                    "true_answer": result["task_metadata"].get("true_answer", ""),
+                    "execution_time": result["execution_time"],
+                }
+                
+                # Add agent memory if configured
+                if self.config.save_full_traces and "agent_memory" in result:
+                    scored_data["agent_memory"] = result["agent_memory"]
+                
+                # Score the trajectory
+                score = self._score_trajectory(
+                    scored_data["prompt"],
+                    scored_data["response"],
+                    scored_data["true_answer"],
+                    scored_data.get("agent_memory"),
+                    scored_data["execution_time"]
+                )
+                
+                scored_data["score"] = score
+                
+                # Create ScoredDataGroup
+                item_for_scoring = next((i for i in items if i.metadata.get("task_id") == result["task_id"]), None)
+                if item_for_scoring:
+                    scored_group = self._create_scored_data_group(item_for_scoring, scored_data)
+                    to_postprocess.append(scored_group)
+                else:
+                    logger.warning(f"Could not find original item for task_id {result['task_id']}")
+            else:
+                # Handle error case - create fallback response
+                logger.error(f"Error in process for task {result['task_id']}: {result.get('error_message', 'Unknown error')}")
+                
+                # Create fallback scored group
+                item_for_scoring = next((i for i in items if i.metadata.get("task_id") == result["task_id"]), None)
+                if item_for_scoring:
+                    fallback = self._create_fallback_response(
+                        item_for_scoring,
+                        result.get("error_message", "Unknown error")
+                    )
+                    to_postprocess.append(fallback)
+                else:
+                    logger.warning(f"Could not find original item for task_id {result['task_id']}")
+        
+        # Return processed results
+        logger.info(f"Final to_postprocess: len={len(to_postprocess)}")
         return to_postprocess, backlog
         
     async def postprocess_histories(
@@ -873,13 +1048,19 @@ class SmolagentsEnv(BaseEnv):
         """Clean up resources when environment is closed."""
         logger.info("Cleaning up SmolagentsEnv resources")
         
-        # Free AsyncBridge resources to prevent hanging
-        try:
-            from atroposlib.utils.async_bridge import shutdown_bridge
-            shutdown_bridge()
-            logger.info("Shutdown AsyncBridge successfully")
-        except Exception as e:
-            logger.error(f"Error shutting down AsyncBridge: {e}")
+        if self.use_process_isolation:
+            # Clean up the server proxy manager
+            if self.server_proxy_manager:
+                self.server_proxy_manager.stop()
+                logger.info("Stopped server proxy manager")
+        else:
+            # Free AsyncBridge resources to prevent hanging in legacy mode
+            try:
+                from atroposlib.utils.async_bridge import shutdown_bridge
+                shutdown_bridge()
+                logger.info("Shutdown AsyncBridge successfully")
+            except Exception as e:
+                logger.error(f"Error shutting down AsyncBridge: {e}")
         
         # Let the parent class do its cleanup
         await super().cleanup()

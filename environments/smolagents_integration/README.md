@@ -20,6 +20,13 @@ The integration consists of:
 - `patched_async_bridge.py`: Enhanced AsyncBridge with better error handling and debugging.
 - `run_gaia_benchmark.py`: Script for running the GAIA benchmark with the integrated system.
 - `run_gaia_single_task.py`: Script for running a single GAIA benchmark task with detailed output.
+
+**Process-Based Implementation Files:**
+- `server_proxy.py`: Proxy mechanism for communication between processes and Atropos server.
+- `smolagents_model.py`: Process-safe Atropos server model implementation for SmolaGents.
+- `agent_process_runner.py`: Module for running agents in separate processes.
+
+**Tools:**
 - `tools/`: Directory containing implementations of tools:
   - `file_tools.py`: Tools for reading, writing, and appending to files
   - `tavily_tools.py`: Web search and page extraction tools powered by Tavily
@@ -141,23 +148,47 @@ Configuration options for `SmolagentsEnv`:
 
 ```python
 class SmolagentsEnvConfig(BaseEnvConfig):
+    # Dataset configuration
     dataset_path: str = Field(default="data/gaia", description="Path to GAIA dataset")
     split: str = Field(default="train", description="Dataset split to use")
+    
+    # Model configuration
     use_chat_completion: bool = Field(default=True, description="Use chat completion API")
+    
+    # Agent configuration
     max_steps: int = Field(default=12, description="Maximum number of agent steps")
     tools_enabled: List[str] = Field(
         default=["python", "file_reader", "web_search"], 
         description="Enabled tools"
     )
     agent_verbosity: int = Field(default=2, description="Agent verbosity level")
+    
+    # Scoring configuration
     scoring_strategy: str = Field(
         default="combined", 
         description="Scoring strategy: basic, correctness, or combined"
     )
-    bridge_timeout_factor: float = Field(default=1.5, description="Safety factor for AsyncBridge timeouts")
-    max_concurrent_agents: int = Field(default=5, description="Maximum concurrent agent executions")
     length_penalty_weight: float = Field(default=0.1, description="Weight for length penalty in scoring")
+    
+    # Output configuration
     save_full_traces: bool = Field(default=True, description="Save full agent execution traces")
+    
+    # Parallelism configuration (legacy mode)
+    max_concurrent_agents: int = Field(default=5, description="Maximum concurrent agent executions")
+    
+    # Process-based isolation configuration (new)
+    use_process_isolation: bool = Field(
+        default=True,
+        description="Whether to use process-based isolation for agent execution"
+    )
+    max_concurrent_processes: int = Field(
+        default=8,
+        description="Maximum number of concurrent processes for agent execution"
+    )
+    process_timeout: int = Field(
+        default=240,  # 4 minutes by default
+        description="Timeout for agent processes in seconds"
+    )
 ```
 
 ### AtroposServerModel
@@ -250,16 +281,68 @@ agent = CodeAgent(
 result = agent.run("Your prompt here")
 ```
 
+## Process-Based Isolation
+
+The SmolaGents integration now supports true parallel execution of agent processes using multiprocessing. This allows for significantly better performance when running multiple agents simultaneously.
+
+### How It Works
+
+The process-based isolation implementation:
+1. Creates a server proxy mechanism to communicate with the Atropos server from child processes
+2. Spawns separate Python processes for each agent execution
+3. Manages inter-process communication through queues
+4. Collects and processes results from all agents
+
+### Configuration Options
+
+The process-based isolation can be configured through the following options:
+
+```
+# Enable/disable process-based isolation (default: True)
+--env_use_process_isolation=true
+
+# Set the maximum number of concurrent processes (default: 8)
+--env_max_concurrent_processes=8
+
+# Set the timeout for agent processes in seconds (default: 240)
+--env_process_timeout=240
+```
+
+### Example Command
+
+To run with process-based isolation and 8 concurrent processes:
+```bash
+python -m environments.smolagents_integration.smolagents_env process \
+  --env_group_size=8 \
+  --env_use_process_isolation=true \
+  --env_max_concurrent_processes=8 \
+  --openai_model_name "llama-3-70b-instruct" \
+  --openai_base_url "http://localhost:8000/v1"
+```
+
+### Legacy Mode
+
+For backwards compatibility, you can still use the old thread-based execution by disabling process isolation:
+```bash
+python -m environments.smolagents_integration.smolagents_env process \
+  --env_group_size=5 \
+  --env_use_process_isolation=false \
+  --env_max_concurrent_agents=5 \
+  --openai_model_name "llama-3-70b-instruct" \
+  --openai_base_url "http://localhost:8000/v1"
+```
+
 ## Troubleshooting
 
 - **Async/Sync issues**: If you encounter async-related errors, make sure you're correctly bridging the async/sync boundary. The `patched_async_bridge.py` provides enhanced error reporting and timeout handling.
+- **Process-related errors**: When using process-based isolation, ensure your code is serializable for multiprocessing. Also, check that proxy communication is working properly.
 - **Message format errors**: Check that message conversions between SmolaGents and Atropos formats are correct.
 - **Missing GAIA data**: Make sure you've downloaded the GAIA benchmark data correctly.
 - **Web tool errors**: If Tavily tools aren't working, make sure you have set the `TAVILY_API_KEY` environment variable and have installed the `tavily-python` package.
 - **Tool import errors**: If you see errors about missing tool modules, ensure your working directory allows proper imports of the tools folder.
 - **Permission errors with file tools**: Ensure your process has the correct permissions to read/write files in the directories being accessed.
-- **Semaphore limitation**: If many agent runs are timing out, try lowering the `max_concurrent_agents` parameter in SmolagentsEnv.
-- **Memory issues**: If you encounter memory leaks, ensure that AsyncBridge cleanup is being called during environment shutdown.
+- **Semaphore limitation**: If many agent runs are timing out with legacy mode, try lowering the `max_concurrent_agents` parameter or switch to process-based isolation.
+- **Memory issues**: If you encounter memory leaks in legacy mode, ensure that AsyncBridge cleanup is being called during environment shutdown. Process-based isolation should not have this issue as processes are terminated after completion.
 
 ## Contributing
 
