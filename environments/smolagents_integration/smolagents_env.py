@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import multiprocessing
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -84,6 +85,11 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default=True,
         description="Save full agent execution traces in the output"
     )
+    # Output path configured in __init__
+    data_path_to_save_groups: Optional[str] = Field(
+        default=None,
+        description="Path to save JSONL output (defaults to timestamped file if None)"
+    )
     # New process-based settings
     max_concurrent_processes: int = Field(
         default=5,
@@ -137,7 +143,7 @@ class SmolagentsEnv(BaseEnv):
             dataset_path="data/gaia",
             split="validation",  # GAIA only supports 'validation' and 'test' splits
             use_chat_completion=True,
-            data_path_to_save_groups="output.jsonl",  # Default output file path
+            # Using default timestamped output path from the config definition
         )
         server_configs = [
             OpenaiConfig(
@@ -156,6 +162,12 @@ class SmolagentsEnv(BaseEnv):
         slurm=False,
         testing=False,
     ):
+        # Set a timestamped output file path if not provided
+        if config.data_path_to_save_groups is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            config.data_path_to_save_groups = f"smolagents_output_{timestamp}.jsonl"
+            print(f"Using auto-generated output path: {config.data_path_to_save_groups}")
+        
         # Initialize the base class
         super().__init__(config, server_configs, slurm, testing)
         
