@@ -73,10 +73,7 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default="combined", 
         description="Scoring strategy: basic, correctness, or combined"
     )
-    max_concurrent_agents: int = Field(
-        default=5, 
-        description="Maximum concurrent agent executions"
-    )
+    # Removed max_concurrent_agents as we only use process-based execution
     length_penalty_weight: float = Field(
         default=0.1,
         description="Weight for length penalty in scoring (0.0 to disable)"
@@ -90,7 +87,7 @@ class SmolagentsEnvConfig(BaseEnvConfig):
         default=None,
         description="Path to save JSONL output (defaults to timestamped file if None)"
     )
-    # New process-based settings
+    # Process-based settings
     max_concurrent_processes: int = Field(
         default=5,
         description="Maximum number of concurrent processes for agent execution"
@@ -98,10 +95,6 @@ class SmolagentsEnvConfig(BaseEnvConfig):
     process_timeout: int = Field(
         default=240,  # 4 minutes by default
         description="Timeout for agent processes in seconds"
-    )
-    use_process_isolation: bool = Field(
-        default=True,
-        description="Whether to use process-based isolation for agent execution"
     )
 
 
@@ -134,11 +127,8 @@ class SmolagentsEnv(BaseEnv):
             wandb_name="smolagents",
             include_messages=True,
             # Process-based settings
-            use_process_isolation=True,
             max_concurrent_processes=8,
             process_timeout=240,
-            # Legacy settings (used only if use_process_isolation=False)
-            max_concurrent_agents=5,
             # Common settings
             dataset_path="data/gaia",
             split="validation",  # GAIA only supports 'validation' and 'test' splits
@@ -179,18 +169,11 @@ class SmolagentsEnv(BaseEnv):
         # Initialize the server proxy manager for process-based execution
         self.server_proxy_manager = None  # Will be initialized in setup()
         
-        # For legacy mode (when not using process isolation)
-        self.agent = None
-        self.model = None
-        self.tools = []
-        self.agent_semaphore = None  # Will be initialized in setup()
-        
         # Save config for easier access
         self.max_steps = config.max_steps
         self.tools_enabled = config.tools_enabled
         self.verbosity = config.agent_verbosity
         self.scoring_strategy = config.scoring_strategy
-        self.use_process_isolation = config.use_process_isolation
         
         # Track agent execution times and metrics
         self.agent_execution_times = []
@@ -202,45 +185,14 @@ class SmolagentsEnv(BaseEnv):
         logger.info("Setting up SmolagentsEnv...")
         logger.info(f"Using dataset split: {self.config.split}")
         
-        # Initialize the appropriate execution mechanism based on configuration
-        if self.use_process_isolation:
-            logger.info("Using process-based isolation for agent execution")
-            
-            # Initialize the server proxy manager
-            self.server_proxy_manager = ServerProxyManager(
-                server=self.server,
-                max_workers=self.config.max_concurrent_processes
-            )
-            self.server_proxy_manager.start()
-            logger.info(f"Started server proxy manager with max_workers={self.config.max_concurrent_processes}")
-        else:
-            logger.info("Using thread-based agent execution (legacy mode)")
-            
-            # Create a semaphore to limit concurrent agent executions
-            self.agent_semaphore = asyncio.Semaphore(self.config.max_concurrent_agents)
-            
-            # Create AtroposServerModel wrapper for legacy mode
-            self.model = AtroposServerModel(
-                server=self.server,
-                use_chat_completion=self.config.use_chat_completion,
-                model_id="atropos-smolagents",
-            )
-            
-            # Create tools for the agent in legacy mode
-            self.tools = self._create_tools()
-            
-            # Initialize the CodeAgent with our tools and model
-            self.agent = CodeAgent(
-                tools=self.tools,
-                model=self.model,
-                max_steps=self.max_steps,
-                additional_authorized_imports=["*"],  # Allow all imports for flexibility
-                verbosity_level=self.verbosity,
-            )
-            
-            from environments.smolagents_integration.patched_async_bridge import patch_asyncbridge
-            patch_asyncbridge()  # Patch AsyncBridge for legacy mode
-            logger.info("Patched AsyncBridge for legacy mode execution")
+        # Initialize the server proxy manager
+        logger.info("Setting up process-based isolation for agent execution")
+        self.server_proxy_manager = ServerProxyManager(
+            server=self.server,
+            max_workers=self.config.max_concurrent_processes
+        )
+        self.server_proxy_manager.start()
+        logger.info(f"Started server proxy manager with max_workers={self.config.max_concurrent_processes}")
         
         # Load the GAIA dataset
         try:
@@ -350,58 +302,18 @@ class SmolagentsEnv(BaseEnv):
         
         return item
     
-    async def _collect_with_semaphore(self, semaphore, item: Item) -> Tuple[Any, List[Item]]:
-        """Run agent with semaphore to limit concurrency (legacy mode)."""
-        async with semaphore:
-            return await self.collect_trajectory(item)
-    
     async def collect_trajectories(self, items: Union[Item, List[Item]]) -> Tuple[
         Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]], List[Any]],
         List[Item],
     ]:
         """
-        Collect trajectories for multiple items using either process-based or legacy concurrency control.
+        Collect trajectories for multiple items using process-based parallelism.
         """
         # Handle both single item and list of items
         if not isinstance(items, list):
             items = [items] * self.config.group_size
         
-        if self.use_process_isolation:
-            # Use process-based isolation
-            return await self._collect_trajectories_process_based(items)
-        else:
-            # Use legacy semaphore-based approach
-            return await self._collect_trajectories_legacy(items)
-    
-    async def _collect_trajectories_legacy(self, items: List[Item]) -> Tuple[List[Any], List[Item]]:
-        """Legacy approach using semaphores and AsyncBridge."""
-        # Create tasks with semaphore to limit concurrency
-        tasks = []
-        for item in items:
-            tasks.append(self._collect_with_semaphore(self.agent_semaphore, item))
-        
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks)
-        
-        # Process results
-        backlog = []
-        to_postprocess = []
-        
-        logger.info(f"Got {len(results)} results from agent executions (legacy mode)")
-        
-        for i, result in enumerate(results):
-            logger.info(f"Result {i}: type={type(result)}, is_none={result[0] is None}, backlog_len={len(result[1])}")
-            if result[0] is not None:
-                to_postprocess.append(result[0])
-                logger.info(f"  Added result to to_postprocess: {type(result[0])}")
-            else:
-                logger.warning(f"  Skipping None result at index {i}")
-            backlog.extend(result[1])
-        
-        logger.info(f"Final to_postprocess: type={type(to_postprocess)}, len={len(to_postprocess)}")
-        logger.info(f"Final backlog: type={type(backlog)}, len={len(backlog)}")
-        
-        return to_postprocess, backlog
+        return await self._collect_trajectories_process_based(items)
     
     async def _collect_trajectories_process_based(self, items: List[Item]) -> Tuple[List[Any], List[Item]]:
         """
@@ -580,130 +492,7 @@ class SmolagentsEnv(BaseEnv):
         logger.info(f"  Final merged data: tokens={len(merged['tokens'])}, scores={len(merged['scores'])}")
         return merged
     
-    async def collect_trajectory(self, item: Item) -> Tuple[Any, List[Item]]:
-        """
-        Run the agent on a single problem and collect results.
-        
-        This method:
-        1. Executes the CodeAgent with the prompt
-        2. Times the execution for monitoring
-        3. Extracts the agent memory and final answer
-        4. Scores the trajectory against the reference solution
-        5. Returns the scored data for training
-        """
-        logger.info(f"Running agent on task: {item.metadata['task_id']}")
-        
-        # Set up execution timing
-        start_time = time.time()
-        agent_result = None
-        error = None
-        
-        try:
-            # Execute the agent with timeout protection
-            timeout = self.max_steps * 20  # Estimate: 20 seconds per step max
-            agent_task = asyncio.create_task(self._run_agent(item.prompt))
-            
-            try:
-                # Wait for the agent to complete with timeout
-                agent_result = await asyncio.wait_for(agent_task, timeout=timeout)
-                
-                # Record execution time
-                execution_time = time.time() - start_time
-                self.agent_execution_times.append(execution_time)
-                logger.info(f"Agent completed in {execution_time:.2f} seconds")
-                
-                # Extract agent memory and final answer
-                agent_memory = self._extract_agent_memory()
-                
-                # Score the trajectory 
-                score = self._score_trajectory(
-                    item.prompt, 
-                    agent_result, 
-                    item.metadata["true_answer"],
-                    agent_memory,
-                    execution_time
-                )
-                
-                # Create scored data for this trajectory
-                scored_data = {
-                    "prompt": item.prompt,
-                    "response": agent_result,
-                    "score": score,
-                    "task_id": item.metadata["task_id"],
-                    "task": item.metadata["task"],
-                    "true_answer": item.metadata["true_answer"],
-                    "execution_time": execution_time,
-                }
-                
-                # Add agent memory if configured
-                if self.config.save_full_traces:
-                    scored_data["agent_memory"] = agent_memory
-                
-                # Generate ScoredDataGroup for the trainer
-                scored_group = self._create_scored_data_group(item, scored_data)
-                
-                return scored_group, []
-                
-            except asyncio.TimeoutError:
-                error = f"Agent execution timed out after {timeout} seconds"
-                logger.error(f"{error} for task {item.metadata['task_id']}")
-                # Create fallback response
-                return self._create_fallback_response(item, error), []
-                
-        except Exception as e:
-            execution_time = time.time() - start_time
-            error = f"Error in agent execution: {str(e)}"
-            logger.error(f"{error} for task {item.metadata['task_id']}")
-            # Create fallback response for training
-            return self._create_fallback_response(item, error), []
-    
-    async def _run_agent(self, prompt: str) -> str:
-        """Run the agent with the given prompt."""
-        # This is wrapped in its own method for easier error handling
-        return self.agent.run(prompt)
-    
-    def _extract_agent_memory(self) -> List[Dict]:
-        """Extract the agent's execution trace and memory."""
-        try:
-            # Extract chat history or other memory format from agent
-            if hasattr(self.agent, "write_memory_to_messages"):
-                return self.agent.write_memory_to_messages()
-            elif hasattr(self.agent, "memory"):
-                # Convert memory to message format if possible
-                return self._format_agent_memory(self.agent.memory)
-            else:
-                logger.warning("Could not extract agent memory - agent has no memory attribute")
-                return []
-        except Exception as e:
-            logger.error(f"Error extracting agent memory: {e}")
-            return []
-    
-    def _format_agent_memory(self, memory) -> List[Dict]:
-        """Format agent memory into a standardized message format."""
-        messages = []
-        
-        # Handle different memory formats
-        if isinstance(memory, list):
-            for entry in memory:
-                if isinstance(entry, dict) and "role" in entry and "content" in entry:
-                    # Already in message format
-                    messages.append(entry)
-                elif hasattr(entry, "as_message"):
-                    # Has conversion method
-                    messages.append(entry.as_message())
-                else:
-                    # Try to infer format
-                    role = "system"
-                    if hasattr(entry, "role"):
-                        role = entry.role
-                    
-                    content = str(entry)
-                    if hasattr(entry, "content"):
-                        content = entry.content
-                        
-                    messages.append({"role": role, "content": content})
-        
-        return messages
+    # Legacy single-agent methods removed - we only use process-based execution
     
     def _score_trajectory(
         self, 
@@ -939,6 +728,8 @@ class SmolagentsEnv(BaseEnv):
         correct_count = 0
         total_time = 0
         
+        # Create items for evaluation
+        eval_items = []
         for example in eval_examples:
             # Create an Item for this example
             item = Item(
@@ -950,29 +741,31 @@ class SmolagentsEnv(BaseEnv):
                     "file_name": example.get("file_name", ""),
                 }
             )
+            eval_items.append(item)
             
-            # Use a separate worker for each evaluation
-            worker = asyncio.create_task(self.collect_trajectory(item))
-            self.eval_workers.add(worker)
-            worker.add_done_callback(self.eval_workers.discard)
+        # Use the existing process-based trajectory collection
+        scored_groups, _ = await self.collect_trajectories(eval_items)
             
-            # Wait for completion and collect results
-            result, _ = await worker
-            
-            if result:
-                # Extract response and score from scored group
-                if isinstance(result, ScoredDataGroup):
-                    score = result["scores"][0] if result["scores"] else 0
-                    results.append({
-                        "task_id": item.metadata["task_id"],
-                        "score": score,
-                    })
-                    
-                    if score > 0.5:  # Consider it correct if score > 0.5
-                        correct_count += 1
-                    
-                    # Extract execution time if available
-                    total_time += getattr(result, "execution_time", 0)
+        # Process the scored groups
+        for scored_group in scored_groups:
+            if isinstance(scored_group, ScoredDataGroup):
+                score = scored_group["scores"][0] if "scores" in scored_group and scored_group["scores"] else 0
+                
+                # Try to extract the task_id from metadata
+                task_id = None
+                if "group_overrides" in scored_group and scored_group["group_overrides"]:
+                    task_id = scored_group["group_overrides"].get("task_id")
+                
+                results.append({
+                    "task_id": task_id or "unknown",
+                    "score": score,
+                })
+                
+                if score > 0.5:  # Consider it correct if score > 0.5
+                    correct_count += 1
+                
+                # Since we're using the process-based approach, the execution time
+                # is stored in the server metrics which are already tracked
         
         # Calculate metrics
         if results:
@@ -1061,19 +854,10 @@ class SmolagentsEnv(BaseEnv):
         """Clean up resources when environment is closed."""
         logger.info("Cleaning up SmolagentsEnv resources")
         
-        if self.use_process_isolation:
-            # Clean up the server proxy manager
-            if self.server_proxy_manager:
-                self.server_proxy_manager.stop()
-                logger.info("Stopped server proxy manager")
-        else:
-            # Free AsyncBridge resources to prevent hanging in legacy mode
-            try:
-                from atroposlib.utils.async_bridge import shutdown_bridge
-                shutdown_bridge()
-                logger.info("Shutdown AsyncBridge successfully")
-            except Exception as e:
-                logger.error(f"Error shutting down AsyncBridge: {e}")
+        # Clean up the server proxy manager
+        if self.server_proxy_manager:
+            self.server_proxy_manager.stop()
+            logger.info("Stopped server proxy manager")
         
         # Let the parent class do its cleanup
         await super().cleanup()
