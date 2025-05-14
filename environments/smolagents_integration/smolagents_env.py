@@ -548,250 +548,199 @@ class SmolagentsEnv(BaseEnv):
         execution_time: float = 0,
     ) -> float:
         """
-        Score the agent trajectory based on the chosen scoring strategy.
+        Score the agent trajectory based on multiple criteria:
+        - Answer correctness using GAIA scoring
+        - Message format adherence 
+        - Final answer tool usage
+        - Execution success (detection of errors)
+        - Efficiency (steps and time)
 
-        Supports multiple scoring methods:
-        - basic: Simple correctness check
-        - correctness: More sophisticated answer validation
-        - combined: Blend of correctness, efficiency, and reasoning quality
-
-        When debug_scoring is enabled, prints detailed breakdown of score calculations.
+        Args:
+            prompt: The original task prompt
+            agent_response: The final response from the agent
+            true_answer: The ground truth answer
+            agent_memory: The memory trace of the agent's steps
+            execution_time: Time taken for execution
+            
+        Returns:
+            float: A score between 0.0 and 1.0
         """
         try:
-            # Apply the appropriate scoring strategy
-            if self.scoring_strategy == "basic":
-                # Simple scoring: check if true answer appears in response
+            # Initialize component scores
+            correctness_score = 0.0
+            format_score = 0.0
+            final_answer_score = 0.0
+            execution_score = 0.0
+            efficiency_score = 0.0
+            
+            # 1. Calculate correctness score using GAIA scorer
+            try:
+                from environments.smolagents_integration.evaluations.smolagent_integrations.rubrics.gaia_scorer import (
+                    question_scorer, 
+                    check_close_call
+                )
+                
+                is_correct = question_scorer(agent_response, true_answer)
+                is_near_correct = check_close_call(agent_response, true_answer, is_correct)
+                
+                if is_correct:
+                    correctness_score = 1.0
+                elif is_near_correct:
+                    correctness_score = 0.5
+                else:
+                    correctness_score = 0.0
+                    
+            except ImportError:
+                # Fall back to basic string matching if GAIA scorer is not available
+                logger.warning("GAIA scorer not available, using basic string matching")
                 has_correct_answer = true_answer.lower() in agent_response.lower()
-                score = 1.0 if has_correct_answer else 0.0
-
-                if self.debug_scoring:
-                    logger.info("=== SCORE CALCULATION (basic) ===")
-                    logger.info(f"True answer: '{true_answer}'")
-                    logger.info(f"Found in response: {has_correct_answer}")
-                    logger.info(f"Final score: {score:.3f}")
-
-                return score
-
-            elif self.scoring_strategy == "correctness":
-                # Try to use gaia_scorer if available
-                try:
-                    from environments.smolagents_integration.gaia_scorer import (
-                        score_answer,
+                correctness_score = 1.0 if has_correct_answer else 0.0
+            
+            # 2. Check format adherence
+            if agent_memory:
+                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
+                    check_format_adherence
+                )
+                
+                format_scores = []
+                for step in agent_memory:
+                    if "content" in step and isinstance(step["content"], str):
+                        format_scores.append(check_format_adherence(step["content"]))
+                    elif "model_output" in step and isinstance(step["model_output"], str):
+                        format_scores.append(check_format_adherence(step["model_output"]))
+                
+                # Average the format scores across all steps
+                format_score = sum(format_scores) / len(format_scores) if format_scores else 0.0
+            
+            # 3. Check for final_answer tool usage
+            final_answer_used = False
+            if agent_memory:
+                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
+                    check_final_answer_usage
+                )
+                
+                for step in agent_memory:
+                    if "content" in step and isinstance(step["content"], str):
+                        if check_final_answer_usage(step["content"]):
+                            final_answer_used = True
+                            break
+                    elif "model_output" in step and isinstance(step["model_output"], str):
+                        if check_final_answer_usage(step["model_output"]):
+                            final_answer_used = True
+                            break
+                
+                final_answer_score = 1.0 if final_answer_used else 0.0
+            
+            # 4. Check for execution errors and calculate execution score
+            if agent_memory:
+                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
+                    calculate_execution_score
+                )
+                
+                execution_score = calculate_execution_score(agent_memory)
+            
+            # 5. Calculate efficiency score
+            if agent_memory:
+                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
+                    calculate_efficiency_score
+                )
+                
+                steps_count = len(agent_memory)
+                efficiency_score = calculate_efficiency_score(
+                    steps_count=steps_count,
+                    max_steps=self.max_steps,
+                    execution_time=execution_time,
+                    execution_times_history=self.agent_execution_times
+                )
+            
+            # Component weights - can be adjusted to emphasize different aspects
+            correctness_weight = 0.50  # 50% of score - correctness matters most
+            format_weight = 0.20       # 20% - format adherence is important
+            final_answer_weight = 0.10  # 10% - using final_answer tool properly
+            execution_weight = 0.10    # 10% - avoiding errors
+            efficiency_weight = 0.10   # 10% - being efficient
+            
+            # Calculate combined score with weights
+            combined_score = (
+                correctness_score * correctness_weight +
+                format_score * format_weight +
+                final_answer_score * final_answer_weight +
+                execution_score * execution_weight +
+                efficiency_score * efficiency_weight 
+            )
+            
+            # Apply length penalty if configured
+            length_penalty = 0.0
+            if self.config.length_penalty_weight > 0 and agent_response:
+                response_length = len(agent_response)
+                # Penalize very long responses
+                if response_length > 2000:
+                    length_penalty = min(
+                        0.3,
+                        self.config.length_penalty_weight * (response_length - 2000) / 1000,
                     )
-
-                    score = score_answer(agent_response, true_answer)
-
-                    if self.debug_scoring:
-                        logger.info("=== SCORE CALCULATION (correctness) ===")
-                        logger.info(f"True answer: '{true_answer}'")
-                        logger.info(f"Using GAIA scorer, score: {score:.3f}")
-
-                    return score
-                except ImportError:
-                    # Fall back to basic scoring
-                    has_correct_answer = true_answer.lower() in agent_response.lower()
-                    score = 1.0 if has_correct_answer else 0.0
-
-                    if self.debug_scoring:
-                        logger.info(
-                            "=== SCORE CALCULATION (correctness - fallback) ==="
-                        )
-                        logger.info(f"True answer: '{true_answer}'")
-                        logger.info(f"GAIA scorer not available, using fallback")
-                        logger.info(f"Found in response: {has_correct_answer}")
-                        logger.info(f"Final score: {score:.3f}")
-
-                    return score
-
-            elif self.scoring_strategy == "combined":
-                # Combined scoring: correctness + efficiency + reasoning quality
-                base_score = 0.0
-
-                if self.debug_scoring:
-                    logger.info("=== SCORE CALCULATION (combined) ===")
-                    logger.info(f"True answer: '{true_answer}'")
-
-                # 1. Check correctness (50% of score)
-                try:
-                    from environments.smolagents_integration.gaia_scorer import (
-                        score_answer,
-                    )
-
-                    correctness_raw = score_answer(agent_response, true_answer)
-                    correctness_score = correctness_raw * 0.5
-
-                    if self.debug_scoring:
-                        logger.info(f"1. Correctness component:")
-                        logger.info(
-                            f"   - Using GAIA scorer, raw score: {correctness_raw:.3f}"
-                        )
-                        logger.info(f"   - Weight: 0.5")
-                        logger.info(f"   - Weighted score: {correctness_score:.3f}")
-                except ImportError:
-                    # Fall back to basic scoring
-                    has_correct_answer = true_answer.lower() in agent_response.lower()
-                    correctness_raw = 1.0 if has_correct_answer else 0.0
-                    correctness_score = correctness_raw * 0.5
-
-                    if self.debug_scoring:
-                        logger.info(f"1. Correctness component:")
-                        logger.info(f"   - GAIA scorer not available, using fallback")
-                        logger.info(f"   - Found in response: {has_correct_answer}")
-                        logger.info(f"   - Raw score: {correctness_raw:.3f}")
-                        logger.info(f"   - Weight: 0.5")
-                        logger.info(f"   - Weighted score: {correctness_score:.3f}")
-
-                # 2. Check efficiency (25% of score)
-                # Penalize long execution times and many steps
-                steps_count = len(agent_memory) if agent_memory else 0
-                efficiency_score = 0.25  # Start with full efficiency score
-                step_penalty = 1.0
-                time_penalty = 1.0
-
-                # Penalty for excessive steps (above 75% of max)
-                if steps_count > (self.max_steps * 0.75):
-                    step_penalty = 0.7
-                    efficiency_score *= step_penalty
-
-                # Penalty for long execution time (if we have other executions to compare)
+                    combined_score = max(0.0, combined_score - length_penalty)
+            
+            # Debug logging for score calculation
+            if self.debug_scoring:
+                logger.info("=== SCORE CALCULATION (detailed) ===")
+                logger.info(f"1. Correctness component:")
+                logger.info(f"   - True answer: '{true_answer}'")
+                logger.info(f"   - Agent answer: '{agent_response}'")
+                logger.info(f"   - Is correct: {is_correct if 'is_correct' in locals() else 'N/A'}")
+                logger.info(f"   - Is near correct: {is_near_correct if 'is_near_correct' in locals() else 'N/A'}")
+                logger.info(f"   - Raw score: {correctness_score:.3f}")
+                logger.info(f"   - Weight: {correctness_weight}")
+                logger.info(f"   - Weighted score: {correctness_score * correctness_weight:.3f}")
+                
+                logger.info(f"2. Format adherence component:")
+                logger.info(f"   - Format scores: {format_scores if 'format_scores' in locals() else []}")
+                logger.info(f"   - Raw score: {format_score:.3f}")
+                logger.info(f"   - Weight: {format_weight}")
+                logger.info(f"   - Weighted score: {format_score * format_weight:.3f}")
+                
+                logger.info(f"3. Final answer tool usage:")
+                logger.info(f"   - Final answer tool used: {final_answer_used}")
+                logger.info(f"   - Raw score: {final_answer_score:.3f}")
+                logger.info(f"   - Weight: {final_answer_weight}")
+                logger.info(f"   - Weighted score: {final_answer_score * final_answer_weight:.3f}")
+                
+                logger.info(f"4. Execution component:")
+                logger.info(f"   - Steps count: {len(agent_memory) if agent_memory else 0}")
+                logger.info(f"   - Raw score: {execution_score:.3f}")
+                logger.info(f"   - Weight: {execution_weight}")
+                logger.info(f"   - Weighted score: {execution_score * execution_weight:.3f}")
+                
+                logger.info(f"5. Efficiency component:")
+                logger.info(f"   - Execution time: {execution_time:.2f}s")
                 if self.agent_execution_times and len(self.agent_execution_times) > 5:
                     avg_time = np.mean(self.agent_execution_times)
-                    if execution_time > (avg_time * 1.5):
-                        time_penalty = 0.8
-                        efficiency_score *= time_penalty
-
-                if self.debug_scoring:
-                    logger.info(f"2. Efficiency component:")
-                    logger.info(
-                        f"   - Steps count: {steps_count} / max {self.max_steps}"
-                    )
-                    logger.info(f"   - Step penalty: {step_penalty:.2f}")
-                    if (
-                        self.agent_execution_times
-                        and len(self.agent_execution_times) > 5
-                    ):
-                        logger.info(
-                            f"   - Execution time: {execution_time:.2f}s (avg: {avg_time:.2f}s)"
-                        )
-                        logger.info(f"   - Time penalty: {time_penalty:.2f}")
-                    else:
-                        logger.info(
-                            f"   - Execution time: {execution_time:.2f}s (not enough data for comparison)"
-                        )
-                    logger.info(f"   - Max possible score: 0.25")
-                    logger.info(f"   - Final efficiency score: {efficiency_score:.3f}")
-
-                # 3. Check reasoning quality (25% of score)
-                reasoning_score = 0.0
-                marker_count = 0
-
-                # Look for step-by-step reasoning with clear intermediate steps
-                # This is a simplified heuristic - could be much more sophisticated
-                if agent_memory and len(agent_memory) > 0:
-                    # Look for reasoning markers in the agent's work
-                    reasoning_markers = [
-                        "first",
-                        "second",
-                        "third",
-                        "step",
-                        "approach",
-                        "reason",
-                        "because",
-                        "therefore",
-                        "thus",
-                        "hence",
-                        "calculate",
-                        "compute",
-                        "solve",
-                        "find",
-                        "determine",
-                    ]
-
-                    # Count reasoning markers in memory content
-                    marker_counts_by_type = {}
-                    for message in agent_memory:
-                        content = message.get("content", "")
-                        if isinstance(content, str):
-                            for marker in reasoning_markers:
-                                if marker in content.lower():
-                                    marker_counts_by_type[marker] = (
-                                        marker_counts_by_type.get(marker, 0) + 1
-                                    )
-                                    marker_count += 1
-
-                    # Normalize reasoning score
-                    reasoning_score = min(0.25, (marker_count / 10) * 0.25)
-
-                if self.debug_scoring:
-                    logger.info(f"3. Reasoning quality component:")
-                    logger.info(
-                        f"   - Memory trace length: {len(agent_memory) if agent_memory else 0} messages"
-                    )
-                    logger.info(f"   - Total reasoning markers found: {marker_count}")
-                    if marker_count > 0 and agent_memory:
-                        logger.info(f"   - Marker breakdown:")
-                        for marker, count in marker_counts_by_type.items():
-                            logger.info(f"     - '{marker}': {count}")
-                    logger.info(f"   - Max possible score: 0.25")
-                    logger.info(f"   - Final reasoning score: {reasoning_score:.3f}")
-
-                # Combine scores
-                base_score = correctness_score + efficiency_score + reasoning_score
-
-                # Apply length penalty if configured
-                length_penalty = 0.0
-                if self.config.length_penalty_weight > 0 and agent_response:
-                    response_length = len(agent_response)
-                    # Penalize very long responses
-                    if response_length > 2000:
-                        length_penalty = min(
-                            0.3,
-                            self.config.length_penalty_weight
-                            * (response_length - 2000)
-                            / 1000,
-                        )
-                        base_score = max(0.0, base_score - length_penalty)
-
-                if self.debug_scoring:
-                    logger.info(f"4. Length penalty:")
-                    logger.info(
-                        f"   - Response length: {len(agent_response)} characters"
-                    )
-                    logger.info(
-                        f"   - Penalty weight: {self.config.length_penalty_weight}"
-                    )
-                    logger.info(f"   - Length penalty: {length_penalty:.3f}")
-                    logger.info(f"5. Final score calculation:")
-                    logger.info(f"   - Correctness: {correctness_score:.3f}")
-                    logger.info(f"   - Efficiency: {efficiency_score:.3f}")
-                    logger.info(f"   - Reasoning: {reasoning_score:.3f}")
-                    logger.info(f"   - Length penalty: -{length_penalty:.3f}")
-                    logger.info(f"   - FINAL SCORE: {base_score:.3f}")
-
-                return base_score
-
-            else:
-                # Unknown scoring strategy
-                logger.warning(
-                    f"Unknown scoring strategy: {self.scoring_strategy}, using basic"
-                )
-                has_correct_answer = true_answer.lower() in agent_response.lower()
-                score = 1.0 if has_correct_answer else 0.0
-
-                if self.debug_scoring:
-                    logger.info(
-                        "=== SCORE CALCULATION (unknown strategy - fallback to basic) ==="
-                    )
-                    logger.info(f"True answer: '{true_answer}'")
-                    logger.info(f"Found in response: {has_correct_answer}")
-                    logger.info(f"Final score: {score:.3f}")
-
-                return score
+                    logger.info(f"   - Average execution time: {avg_time:.2f}s")
+                logger.info(f"   - Raw score: {efficiency_score:.3f}")
+                logger.info(f"   - Weight: {efficiency_weight}")
+                logger.info(f"   - Weighted score: {efficiency_score * efficiency_weight:.3f}")
+                
+                logger.info(f"6. Length penalty:")
+                logger.info(f"   - Response length: {len(agent_response)} characters")
+                logger.info(f"   - Penalty: {length_penalty:.3f}")
+                
+                logger.info(f"7. Final score calculation:")
+                logger.info(f"   - Correctness: {correctness_score * correctness_weight:.3f}")
+                logger.info(f"   - Format adherence: {format_score * format_weight:.3f}")
+                logger.info(f"   - Final answer tool: {final_answer_score * final_answer_weight:.3f}")
+                logger.info(f"   - Execution: {execution_score * execution_weight:.3f}")
+                logger.info(f"   - Efficiency: {efficiency_score * efficiency_weight:.3f}")
+                logger.info(f"   - Length penalty: -{length_penalty:.3f}")
+                logger.info(f"   - FINAL SCORE: {combined_score:.3f}")
+            
+            return combined_score
 
         except Exception as e:
             logger.error(f"Error in scoring: {e}")
             if self.debug_scoring:
                 logger.error(f"Exception during score calculation: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return 0.0
 
     def _create_scored_data_group(
