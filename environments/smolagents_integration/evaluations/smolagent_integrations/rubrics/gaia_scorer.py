@@ -11,7 +11,7 @@ def normalize_number_str(number_str: str) -> float:
     try:
         return float(number_str)
     except ValueError:
-        print(f"String {number_str} cannot be normalized to number str.")
+        # Remove print statement to avoid duplicate output
         return float("inf")
 
 
@@ -95,7 +95,7 @@ def check_close_call(prediction, true_answer, is_correct):
                 check_prediction_contains_answer_letters_in_order(str(prediction), str(true_answer))
                 and len(str(true_answer)) * 0.5 <= len(str(prediction)) <= len(str(true_answer)) * 2
             ):
-                print(f"Close call: {prediction} vs {true_answer}")
+                # Remove print statement that causes duplicated output
                 return True
             else:
                 return False

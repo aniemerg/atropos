@@ -100,18 +100,19 @@ def extract_execution_errors(agent_memory: List[Dict]) -> List[Dict]:
 
 def calculate_efficiency_score(
     steps_count: int, 
-    max_steps: int, 
-    execution_time: float,
-    execution_times_history: Optional[List[float]] = None
+    max_steps: int,
+    execution_time: float = None,  # Parameter kept for backward compatibility but not used
+    execution_times_history: Optional[List[float]] = None  # Parameter kept for backward compatibility but not used
 ) -> float:
     """
-    Calculate efficiency score based on steps used and execution time.
+    Calculate efficiency score based on steps used only.
+    Execution time is no longer considered in the score calculation.
     
     Args:
         steps_count: Number of steps taken by the agent
         max_steps: Maximum allowed steps
-        execution_time: Time taken for execution (in seconds)
-        execution_times_history: Optional history of past execution times
+        execution_time: Not used, kept for backward compatibility
+        execution_times_history: Not used, kept for backward compatibility
         
     Returns:
         float: Efficiency score between 0.0 and 1.0
@@ -125,13 +126,7 @@ def calculate_efficiency_score(
         step_penalty = max(0.5, 1.0 - ((steps_count - max_steps * 0.75) / (max_steps * 0.25)))
         efficiency_score *= step_penalty
     
-    # Penalty for long execution time (if we have other executions to compare)
-    time_penalty = 1.0
-    if execution_times_history and len(execution_times_history) > 5:
-        avg_time = np.mean(execution_times_history)
-        if execution_time > (avg_time * 1.5):
-            time_penalty = max(0.5, 1.0 - ((execution_time - avg_time * 1.5) / (avg_time * 0.5)))
-            efficiency_score *= time_penalty
+    # Note: Execution time penalty has been removed
     
     return efficiency_score
 

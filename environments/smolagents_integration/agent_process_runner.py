@@ -22,6 +22,8 @@ logging.basicConfig(
     level=logging.INFO, format="Process-%(process)d: %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+# Prevent propagation to root logger to avoid duplicate logging
+logger.propagate = False
 
 
 def create_tools():

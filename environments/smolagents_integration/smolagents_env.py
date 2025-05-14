@@ -42,13 +42,17 @@ class Item:
 # Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+# Prevent propagation to root logger to avoid duplicate logging
+logger.propagate = False
 
-# Add a console handler to make sure logs are visible
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter("%(levelname)s - %(message)s")
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+# Only add handler if not already present
+if not logger.handlers:
+    # Add a console handler to make sure logs are visible
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(levelname)s - %(message)s")
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 
 class SmolagentsEnvConfig(BaseEnvConfig):
@@ -545,7 +549,7 @@ class SmolagentsEnv(BaseEnv):
         agent_response: str,
         true_answer: str,
         agent_memory: List[Dict] = None,
-        execution_time: float = 0,
+        execution_time: float = 0,  # Parameter kept for backward compatibility but not used in scoring
     ) -> float:
         """
         Score the agent trajectory based on multiple criteria:
@@ -553,14 +557,14 @@ class SmolagentsEnv(BaseEnv):
         - Message format adherence 
         - Final answer tool usage
         - Execution success (detection of errors)
-        - Efficiency (steps and time)
+        - Efficiency (steps only)
 
         Args:
             prompt: The original task prompt
             agent_response: The final response from the agent
             true_answer: The ground truth answer
             agent_memory: The memory trace of the agent's steps
-            execution_time: Time taken for execution
+            execution_time: Time taken for execution (not used in scoring)
             
         Returns:
             float: A score between 0.0 and 1.0
@@ -648,9 +652,7 @@ class SmolagentsEnv(BaseEnv):
                 steps_count = len(agent_memory)
                 efficiency_score = calculate_efficiency_score(
                     steps_count=steps_count,
-                    max_steps=self.max_steps,
-                    execution_time=execution_time,
-                    execution_times_history=self.agent_execution_times
+                    max_steps=self.max_steps
                 )
             
             # Component weights - can be adjusted to emphasize different aspects
@@ -712,10 +714,8 @@ class SmolagentsEnv(BaseEnv):
                 logger.info(f"   - Weighted score: {execution_score * execution_weight:.3f}")
                 
                 logger.info(f"5. Efficiency component:")
-                logger.info(f"   - Execution time: {execution_time:.2f}s")
-                if self.agent_execution_times and len(self.agent_execution_times) > 5:
-                    avg_time = np.mean(self.agent_execution_times)
-                    logger.info(f"   - Average execution time: {avg_time:.2f}s")
+                logger.info(f"   - Steps count: {len(agent_memory) if agent_memory else 0}")
+                logger.info(f"   - Max steps: {self.max_steps}")
                 logger.info(f"   - Raw score: {efficiency_score:.3f}")
                 logger.info(f"   - Weight: {efficiency_weight}")
                 logger.info(f"   - Weighted score: {efficiency_score * efficiency_weight:.3f}")
