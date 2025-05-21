@@ -48,7 +48,7 @@ from .server_handling.server_manager import (
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)  # Reduced from DEBUG to WARNING
+logger.setLevel(logging.DEBUG)
 
 
 class ScoredDataGroup(TypedDict):
@@ -125,7 +125,7 @@ class BaseEnvConfig(BaseModel):
         default=3, description="Maximum number of batches to have in queue."
     )
     tokenizer_name: str = Field(
-        default="NousResearch/DeepHermes-3-Llama-3-8B-Preview",
+        default="NousResearch/DeepHermes-3-Llama-3-3B-Preview",
         description="Hugging Face tokenzer to use.",
     )
     use_wandb: bool = Field(default=True, description="Whether to use wandb")

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# File tools for the Patent Infringement Analysis Agent
 
 import os
 from smolagents import tool
