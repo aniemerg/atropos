@@ -240,54 +240,7 @@ class SmolagentsEnv(BaseEnv):
 
         logger.info("SmolagentsEnv setup complete")
 
-    def _create_tools(self) -> List[Tool]:
-        """Create and return the tools for the CodeAgent based on config."""
-        tools = []
-        logger.info("Creating tools for CodeAgent")
-
-        # Always add file tools (read, write, append)
-        # These use the @tool decorator and are correctly formed SimpleTool instances
-        tools.append(read_file)
-        tools.append(write_file)
-        tools.append(append_to_file)
-        logger.info("Added file tools (read_file, write_file, append_to_file)")
-
-        # Add web search tool if TAVILY_API_KEY is available
-        try:
-            from environments.smolagents_integration.tools.tavily_tools import (
-                TavilyExtractTool,
-                TavilySearchTool,
-            )
-
-            if os.environ.get("TAVILY_API_KEY"):
-                tavily_search = TavilySearchTool(
-                    api_key=os.environ.get("TAVILY_API_KEY")
-                )
-                tavily_extract = TavilyExtractTool(
-                    api_key=os.environ.get("TAVILY_API_KEY")
-                )
-                tools.append(tavily_search)
-                tools.append(tavily_extract)
-                logger.info("Added web_search tool")
-            else:
-                logger.warning(
-                    "TAVILY_API_KEY not set in environment, web search disabled"
-                )
-        except Exception as e:
-            logger.warning(f"Could not create web search tool: {e}")
-
-        # Log tool info for debugging
-        tool_names = []
-        for i, tool in enumerate(tools):
-            if hasattr(tool, "name"):
-                tool_names.append(tool.name)
-                logger.info(f"Tool {i} name: {tool.name}")
-            else:
-                tool_names.append(str(tool))
-                logger.warning(f"Tool {i} has no name attribute: {tool}")
-
-        logger.info(f"Created {len(tools)} tools for CodeAgent: {tool_names}")
-        return tools
+    # _create_tools method removed - tools are created directly in agent_process_runner.py
 
     async def get_next_item(self) -> Item:
         """Get the next item from the GAIA dataset."""
@@ -460,29 +413,13 @@ class SmolagentsEnv(BaseEnv):
                         f"Could not find original item for task_id {result['task_id']}"
                     )
             else:
-                # Handle error case - create fallback response
-                logger.error(
-                    f"Error in process for task {result['task_id']}: {result.get('error_message', 'Unknown error')}"
+                # Just log the error and omit this example from training
+                error_message = result.get('error_message', 'Unknown error')
+                task_id = result.get('task_id', 'Unknown task')
+                
+                logger.warning(
+                    f"Omitting failed task {task_id} from training batch: {error_message}"
                 )
-
-                # Create fallback scored group
-                item_for_scoring = next(
-                    (
-                        i
-                        for i in items
-                        if i.metadata.get("task_id") == result["task_id"]
-                    ),
-                    None,
-                )
-                if item_for_scoring:
-                    fallback = self._create_fallback_response(
-                        item_for_scoring, result.get("error_message", "Unknown error")
-                    )
-                    to_postprocess.append(fallback)
-                else:
-                    logger.warning(
-                        f"Could not find original item for task_id {result['task_id']}"
-                    )
 
         # Return processed results
         logger.info(f"Final to_postprocess: len={len(to_postprocess)}")
@@ -571,183 +508,163 @@ class SmolagentsEnv(BaseEnv):
         Returns:
             float: A score between 0.0 and 1.0
         """
-        try:
-            # Initialize component scores
-            correctness_score = 0.0
-            format_score = 0.0
-            final_answer_score = 0.0
-            execution_score = 0.0
-            efficiency_score = 0.0
-            
-            # 1. Calculate correctness score using GAIA scorer
+        # Import all scoring functions upfront
+        from environments.smolagents_integration.evaluations.smolagent_integrations.rubrics.gaia_scorer import (
+            question_scorer, check_close_call
+        )
+        from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
+            check_format_adherence, check_final_answer_usage,
+            calculate_execution_score, calculate_efficiency_score
+        )
+        
+        # Initialize component scores
+        correctness_score = 0.0
+        format_score = 0.0
+        final_answer_score = 0.0
+        execution_score = 0.0
+        efficiency_score = 0.0
+        
+        # 1. Calculate correctness score using GAIA scorer
+        # Ensure agent_response is a string before scoring
+        if not isinstance(agent_response, str):
+            logger.warning(f"agent_response is not a string, it's a {type(agent_response)}: {agent_response}")
             try:
-                from environments.smolagents_integration.evaluations.smolagent_integrations.rubrics.gaia_scorer import (
-                    question_scorer, 
-                    check_close_call
-                )
-                
-                is_correct = question_scorer(agent_response, true_answer)
-                is_near_correct = check_close_call(agent_response, true_answer, is_correct)
-                
-                if is_correct:
-                    correctness_score = 1.0
-                elif is_near_correct:
-                    correctness_score = 0.5
+                if isinstance(agent_response, set):
+                    # Convert sets to comma-separated strings
+                    agent_response = ", ".join(str(item) for item in agent_response)
                 else:
-                    correctness_score = 0.0
-                    
-            except ImportError:
-                # Fall back to basic string matching if GAIA scorer is not available
-                logger.warning("GAIA scorer not available, using basic string matching")
-                has_correct_answer = true_answer.lower() in agent_response.lower()
-                correctness_score = 1.0 if has_correct_answer else 0.0
-            
-            # 2. Check format adherence
-            if agent_memory:
-                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
-                    check_format_adherence
-                )
+                    # Try to convert other types to string
+                    agent_response = str(agent_response)
+            except Exception as e:
+                logger.error(f"Failed to convert agent_response to string: {e}")
+                agent_response = ""
                 
-                format_scores = []
-                for step in agent_memory:
-                    if "content" in step and isinstance(step["content"], str):
-                        format_scores.append(check_format_adherence(step["content"]))
-                    elif "model_output" in step and isinstance(step["model_output"], str):
-                        format_scores.append(check_format_adherence(step["model_output"]))
-                
-                # Average the format scores across all steps
-                format_score = sum(format_scores) / len(format_scores) if format_scores else 0.0
+        is_correct = question_scorer(agent_response, true_answer)
+        is_near_correct = check_close_call(agent_response, true_answer, is_correct)
+        
+        if is_correct:
+            correctness_score = 1.0
+        elif is_near_correct:
+            correctness_score = 0.5
+        
+        # 2. Check format adherence
+        if agent_memory:
+            format_scores = []
+            for step in agent_memory:
+                if "content" in step and isinstance(step["content"], str):
+                    format_scores.append(check_format_adherence(step["content"]))
+                elif "model_output" in step and isinstance(step["model_output"], str):
+                    format_scores.append(check_format_adherence(step["model_output"]))
             
+            # Average the format scores across all steps
+            format_score = sum(format_scores) / len(format_scores) if format_scores else 0.0
+        
             # 3. Check for final_answer tool usage
             final_answer_used = False
-            if agent_memory:
-                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
-                    check_final_answer_usage
-                )
-                
-                for step in agent_memory:
-                    if "content" in step and isinstance(step["content"], str):
-                        if check_final_answer_usage(step["content"]):
-                            final_answer_used = True
-                            break
-                    elif "model_output" in step and isinstance(step["model_output"], str):
-                        if check_final_answer_usage(step["model_output"]):
-                            final_answer_used = True
-                            break
-                
-                final_answer_score = 1.0 if final_answer_used else 0.0
+            for step in agent_memory:
+                if "content" in step and isinstance(step["content"], str):
+                    if check_final_answer_usage(step["content"]):
+                        final_answer_used = True
+                        break
+                elif "model_output" in step and isinstance(step["model_output"], str):
+                    if check_final_answer_usage(step["model_output"]):
+                        final_answer_used = True
+                        break
             
+            final_answer_score = 1.0 if final_answer_used else 0.0
+        
             # 4. Check for execution errors and calculate execution score
-            if agent_memory:
-                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
-                    calculate_execution_score
-                )
-                
-                execution_score = calculate_execution_score(agent_memory)
-            
+            execution_score = calculate_execution_score(agent_memory)
+        
             # 5. Calculate efficiency score
-            if agent_memory:
-                from environments.smolagents_integration.evaluations.smolagent_integrations.smolagents_scorer import (
-                    calculate_efficiency_score
-                )
-                
-                steps_count = len(agent_memory)
-                efficiency_score = calculate_efficiency_score(
-                    steps_count=steps_count,
-                    max_steps=self.max_steps
-                )
-            
-            # Component weights - can be adjusted to emphasize different aspects
-            correctness_weight = 0.50  # 50% of score - correctness matters most
-            format_weight = 0.20       # 20% - format adherence is important
-            final_answer_weight = 0.10  # 10% - using final_answer tool properly
-            execution_weight = 0.10    # 10% - avoiding errors
-            efficiency_weight = 0.10   # 10% - being efficient
-            
-            # Calculate combined score with weights
-            combined_score = (
-                correctness_score * correctness_weight +
-                format_score * format_weight +
-                final_answer_score * final_answer_weight +
-                execution_score * execution_weight +
-                efficiency_score * efficiency_weight 
+            steps_count = len(agent_memory)
+            efficiency_score = calculate_efficiency_score(
+                steps_count=steps_count,
+                max_steps=self.max_steps
             )
+        
+        # Component weights - can be adjusted to emphasize different aspects
+        correctness_weight = 0.50  # 50% of score - correctness matters most
+        format_weight = 0.20       # 20% - format adherence is important
+        final_answer_weight = 0.10  # 10% - using final_answer tool properly
+        execution_weight = 0.10    # 10% - avoiding errors
+        efficiency_weight = 0.10   # 10% - being efficient
+        
+        # Calculate combined score with weights
+        combined_score = (
+            correctness_score * correctness_weight +
+            format_score * format_weight +
+            final_answer_score * final_answer_weight +
+            execution_score * execution_weight +
+            efficiency_score * efficiency_weight 
+        )
+        
+        # Apply length penalty if configured
+        length_penalty = 0.0
+        if self.config.length_penalty_weight > 0:
+            # agent_response should already be a string from the previous conversion
+            # but double-check just to be sure
+            response_to_measure = agent_response if isinstance(agent_response, str) else str(agent_response)
+            response_length = len(response_to_measure)
+            # Penalize very long responses
+            if response_length > 2000:
+                length_penalty = min(
+                    0.3,
+                    self.config.length_penalty_weight * (response_length - 2000) / 1000,
+                )
+                combined_score = max(0.0, combined_score - length_penalty)
+        
+        # Debug logging for score calculation
+        if self.debug_scoring:
+            logger.info("=== SCORE CALCULATION (detailed) ===")
+            logger.info(f"1. Correctness component:")
+            logger.info(f"   - True answer: '{true_answer}'")
+            logger.info(f"   - Agent answer: '{agent_response}'")
+            logger.info(f"   - Is correct: {is_correct}")
+            logger.info(f"   - Is near correct: {is_near_correct}")
+            logger.info(f"   - Raw score: {correctness_score:.3f}")
+            logger.info(f"   - Weight: {correctness_weight}")
+            logger.info(f"   - Weighted score: {correctness_score * correctness_weight:.3f}")
             
-            # Apply length penalty if configured
-            length_penalty = 0.0
-            if self.config.length_penalty_weight > 0 and agent_response and isinstance(agent_response, str):
-                response_length = len(agent_response)
-                # Penalize very long responses
-                if response_length > 2000:
-                    length_penalty = min(
-                        0.3,
-                        self.config.length_penalty_weight * (response_length - 2000) / 1000,
-                    )
-                    combined_score = max(0.0, combined_score - length_penalty)
-            elif not isinstance(agent_response, str):
-                # Log the issue but don't fail
-                logger.warning(f"agent_response is not a string, it's a {type(agent_response)}: {agent_response}")
-                # Skip length penalty for non-string responses
+            logger.info(f"2. Format adherence component:")
+            logger.info(f"   - Format scores: {format_scores if 'format_scores' in locals() else []}")
+            logger.info(f"   - Raw score: {format_score:.3f}")
+            logger.info(f"   - Weight: {format_weight}")
+            logger.info(f"   - Weighted score: {format_score * format_weight:.3f}")
             
-            # Debug logging for score calculation
-            if self.debug_scoring:
-                logger.info("=== SCORE CALCULATION (detailed) ===")
-                logger.info(f"1. Correctness component:")
-                logger.info(f"   - True answer: '{true_answer}'")
-                logger.info(f"   - Agent answer: '{agent_response}'")
-                logger.info(f"   - Is correct: {is_correct if 'is_correct' in locals() else 'N/A'}")
-                logger.info(f"   - Is near correct: {is_near_correct if 'is_near_correct' in locals() else 'N/A'}")
-                logger.info(f"   - Raw score: {correctness_score:.3f}")
-                logger.info(f"   - Weight: {correctness_weight}")
-                logger.info(f"   - Weighted score: {correctness_score * correctness_weight:.3f}")
-                
-                logger.info(f"2. Format adherence component:")
-                logger.info(f"   - Format scores: {format_scores if 'format_scores' in locals() else []}")
-                logger.info(f"   - Raw score: {format_score:.3f}")
-                logger.info(f"   - Weight: {format_weight}")
-                logger.info(f"   - Weighted score: {format_score * format_weight:.3f}")
-                
-                logger.info(f"3. Final answer tool usage:")
-                logger.info(f"   - Final answer tool used: {final_answer_used}")
-                logger.info(f"   - Raw score: {final_answer_score:.3f}")
-                logger.info(f"   - Weight: {final_answer_weight}")
-                logger.info(f"   - Weighted score: {final_answer_score * final_answer_weight:.3f}")
-                
-                logger.info(f"4. Execution component:")
-                logger.info(f"   - Steps count: {len(agent_memory) if agent_memory else 0}")
-                logger.info(f"   - Raw score: {execution_score:.3f}")
-                logger.info(f"   - Weight: {execution_weight}")
-                logger.info(f"   - Weighted score: {execution_score * execution_weight:.3f}")
-                
-                logger.info(f"5. Efficiency component:")
-                logger.info(f"   - Steps count: {len(agent_memory) if agent_memory else 0}")
-                logger.info(f"   - Max steps: {self.max_steps}")
-                logger.info(f"   - Raw score: {efficiency_score:.3f}")
-                logger.info(f"   - Weight: {efficiency_weight}")
-                logger.info(f"   - Weighted score: {efficiency_score * efficiency_weight:.3f}")
-                
-                logger.info(f"6. Length penalty:")
-                logger.info(f"   - Response length: {len(agent_response)} characters")
-                logger.info(f"   - Penalty: {length_penalty:.3f}")
-                
-                logger.info(f"7. Final score calculation:")
-                logger.info(f"   - Correctness: {correctness_score * correctness_weight:.3f}")
-                logger.info(f"   - Format adherence: {format_score * format_weight:.3f}")
-                logger.info(f"   - Final answer tool: {final_answer_score * final_answer_weight:.3f}")
-                logger.info(f"   - Execution: {execution_score * execution_weight:.3f}")
-                logger.info(f"   - Efficiency: {efficiency_score * efficiency_weight:.3f}")
-                logger.info(f"   - Length penalty: -{length_penalty:.3f}")
-                logger.info(f"   - FINAL SCORE: {combined_score:.3f}")
+            logger.info(f"3. Final answer tool usage:")
+            logger.info(f"   - Final answer tool used: {final_answer_used if 'final_answer_used' in locals() else False}")
+            logger.info(f"   - Raw score: {final_answer_score:.3f}")
+            logger.info(f"   - Weight: {final_answer_weight}")
+            logger.info(f"   - Weighted score: {final_answer_score * final_answer_weight:.3f}")
             
-            return combined_score
-
-        except Exception as e:
-            logger.error(f"Error in scoring: {e}")
-            if self.debug_scoring:
-                logger.error(f"Exception during score calculation: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return 0.0
+            logger.info(f"4. Execution component:")
+            logger.info(f"   - Steps count: {len(agent_memory) if agent_memory else 0}")
+            logger.info(f"   - Raw score: {execution_score:.3f}")
+            logger.info(f"   - Weight: {execution_weight}")
+            logger.info(f"   - Weighted score: {execution_score * execution_weight:.3f}")
+            
+            logger.info(f"5. Efficiency component:")
+            logger.info(f"   - Steps count: {len(agent_memory) if agent_memory else 0}")
+            logger.info(f"   - Max steps: {self.max_steps}")
+            logger.info(f"   - Raw score: {efficiency_score:.3f}")
+            logger.info(f"   - Weight: {efficiency_weight}")
+            logger.info(f"   - Weighted score: {efficiency_score * efficiency_weight:.3f}")
+            
+            logger.info(f"6. Length penalty:")
+            logger.info(f"   - Response length: {len(agent_response) if isinstance(agent_response, str) else 'N/A'}")
+            logger.info(f"   - Penalty: {length_penalty:.3f}")
+            
+            logger.info(f"7. Final score calculation:")
+            logger.info(f"   - Correctness: {correctness_score * correctness_weight:.3f}")
+            logger.info(f"   - Format adherence: {format_score * format_weight:.3f}")
+            logger.info(f"   - Final answer tool: {final_answer_score * final_answer_weight:.3f}")
+            logger.info(f"   - Execution: {execution_score * execution_weight:.3f}")
+            logger.info(f"   - Efficiency: {efficiency_score * efficiency_weight:.3f}")
+            logger.info(f"   - Length penalty: -{length_penalty:.3f}")
+            logger.info(f"   - FINAL SCORE: {combined_score:.3f}")
+        
+        return combined_score
 
     def _create_scored_data_group(
         self, item: Item, scored_data: Dict
@@ -890,71 +807,6 @@ class SmolagentsEnv(BaseEnv):
 
         return scored_group
 
-    def _create_fallback_response(
-        self, item: Item, error_message: str
-    ) -> ScoredDataGroup:
-        """Create a fallback response for failed agent executions."""
-        # Create a minimal valid response with low score
-        if self.config.include_messages:
-            messages = [
-                {"role": "system", "content": "You are an AI assistant solving tasks."},
-                {"role": "user", "content": item.prompt},
-                {
-                    "role": "assistant",
-                    "content": f"I'm unable to solve this task. Error: {error_message}",
-                },
-            ]
-            
-            # Create a comprehensive markdown document for the fallback case
-            complete_conversation = []
-            
-            # Add task information at the top
-            task_type = item.metadata.get("task", "Unknown task")
-            task_id = item.metadata.get("task_id", "Unknown ID")
-            complete_conversation.append(f"# GAIA Task: {task_type} (ID: {task_id})")
-            complete_conversation.append("## SYSTEM")
-            complete_conversation.append("You are an AI assistant solving tasks.")
-            complete_conversation.append("## USER")
-            complete_conversation.append(item.prompt)
-            complete_conversation.append("## ASSISTANT")
-            complete_conversation.append(f"I'm unable to solve this task. Error: {error_message}")
-            complete_conversation.append("## Score: 0.1 (Error fallback)")
-            
-            # Join everything into a single string with double newlines between sections
-            full_conversation_markdown = "\n\n".join(complete_conversation)
-
-            scored_group = ScoredDataGroup(
-                tokens=[self.tokenizer.encode(json.dumps(messages))],
-                masks=[[1] * len(self.tokenizer.encode(json.dumps(messages)))],
-                scores=[0.1],  # Low score but not zero to allow some learning
-                messages=[full_conversation_markdown],  # Use string for HTML display
-                _original_messages=[messages],  # Keep original for trainer API
-            )
-        else:
-            # Create a proper conversation with role-based messages for fallback
-            messages = [
-                {"role": "system", "content": "You are an AI assistant solving tasks."},
-                {"role": "user", "content": item.prompt},
-                {"role": "assistant", "content": f"I'm unable to solve this task. Error: {error_message}"},
-            ]
-            
-            # Use the standard tokenize_for_trainer utility
-            
-            # Tokenize using the standard utility (only trains on assistant messages)
-            tokenized = tokenize_for_trainer(
-                self.tokenizer, 
-                messages,
-                train_on_all_assistant_turns=True
-            )
-
-            scored_group = ScoredDataGroup(
-                tokens=[tokenized["tokens"]],
-                masks=[tokenized["masks"]],
-                scores=[0.1],  # Low score but not zero
-                messages=None,
-            )
-
-        return scored_group
 
     async def evaluate(self, **kwargs):
         """

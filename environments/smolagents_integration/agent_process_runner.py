@@ -90,6 +90,20 @@ def run_agent_process(
         # Run the agent and get response
         agent_response = agent.run(prompt)
         
+        # Ensure the response is properly formatted (convert sets, etc. to strings)
+        if not isinstance(agent_response, str):
+            logger.info(f"Converting non-string response of type {type(agent_response)} to string")
+            try:
+                if isinstance(agent_response, set):
+                    # Convert sets to comma-separated strings
+                    agent_response = ", ".join(str(item) for item in agent_response)
+                else:
+                    # Try to convert other types to string
+                    agent_response = str(agent_response)
+            except Exception as e:
+                logger.error(f"Failed to convert agent_response to string: {e}")
+                agent_response = str(agent_response)
+        
         # Extract agent memory
         agent_memory = getattr(agent, "memory", None)
         if hasattr(agent, "write_memory_to_messages"):

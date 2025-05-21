@@ -51,6 +51,14 @@ def question_scorer(
     model_answer: str,
     ground_truth: str,
 ) -> bool:
+    # Ensure model_answer is a string
+    if not isinstance(model_answer, str):
+        try:
+            model_answer = str(model_answer)
+        except Exception as e:
+            warnings.warn(f"Failed to convert model_answer to string: {e}. Type: {type(model_answer)}", UserWarning)
+            return False
+
     # if gt is a number
     if is_float(ground_truth):
         normalized_answer = normalize_number_str(str(model_answer))
@@ -129,6 +137,14 @@ def normalize_str(input_str, remove_punct=True) -> str:
     Returns:
     - str, the normalized string
     """
+    # Ensure input is a string
+    if not isinstance(input_str, str):
+        try:
+            input_str = str(input_str)
+        except Exception as e:
+            warnings.warn(f"Failed to convert input to string: {e}. Type: {type(input_str)}", UserWarning)
+            return ""
+            
     # Remove all white spaces. Required e.g for seagull vs. sea gull
     no_spaces = re.sub(r"\s", "", input_str)
 
