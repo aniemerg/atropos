@@ -117,12 +117,12 @@ class ProcessSafeAtroposServerModel(Model):
                 openai_role = "user"
             elif role_str == "assistant":
                 openai_role = "assistant"
-            else:
-                # Default everything else to user
+            elif role_str in ("tool_call", "tool_response", "function_call", "function_response"):  
+                # Silently map tool and function calls/responses to user roles
                 openai_role = "user"
-                logger.info(
-                    f"Message {i}: Converting role '{role}' to 'user' for OpenAI API compatibility"
-                )
+            else:
+                # Default everything else to user without logging
+                openai_role = "user"
 
             # Extract text content if it's in the list format
             if isinstance(content, list):
