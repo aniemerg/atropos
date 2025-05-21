@@ -24,6 +24,7 @@ from atroposlib.envs.base import BaseEnv, BaseEnvConfig, ScoredDataGroup
 from atroposlib.envs.server_handling.openai_server import OpenAIServer
 from atroposlib.envs.server_handling.server_baseline import APIServerConfig
 from atroposlib.envs.server_handling.server_manager import ServerManager
+from atroposlib.utils.tokenize_for_trainer import tokenize_for_trainer
 from environments.smolagents_integration.agent_process_runner import run_agent_process
 from environments.smolagents_integration.server_proxy import ServerProxyManager
 from environments.smolagents_integration.tools.file_tools import (
@@ -783,11 +784,26 @@ class SmolagentsEnv(BaseEnv):
                     {"role": "assistant", "content": scored_data["response"]}
                 )
 
-            # Convert complex message objects to strings for HTML compatibility
-            message_strings = []
-            for msg in messages:
-                role = msg.get("role", "")
+            # Create a comprehensive markdown document for HTML compatibility
+            # Format similar to the Wikipedia environment
+            complete_conversation = []
+            
+            # Add task information at the top
+            task_type = item.metadata.get("task", "Unknown task")
+            task_id = item.metadata.get("task_id", "Unknown ID")
+            complete_conversation.append(f"# GAIA Task: {task_type} (ID: {task_id})")
+            
+            # Process each message in the conversation
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "unknown")
                 content = msg.get("content", "")
+                
+                # Skip empty messages
+                if not content:
+                    continue
+                
+                # Add a header for each role
+                complete_conversation.append(f"## {role.upper()}")
                 
                 # Handle different content formats
                 if isinstance(content, list):
@@ -798,35 +814,76 @@ class SmolagentsEnv(BaseEnv):
                         else:
                             content_text.append(str(item))
                     content = '\n'.join(content_text)
+                elif not isinstance(content, str):
+                    # Handle non-string content
+                    content = str(content)
                 
-                message_strings.append(f"**{role}**: {content}")
+                # Add the message content
+                complete_conversation.append(content)
+                
+                # If this message has agent memory, show it
+                if role == "assistant" and i > 1 and self.config.save_full_traces:
+                    # Agent memory with thinking is often present in assistant messages
+                    if "<thinking>" in content:
+                        complete_conversation.append("### Thinking Process")
+                        # The thinking is already in the content
+                    
+                    # Add tool usage information if present
+                    if "tool_usage" in msg:
+                        tool_name = msg.get("tool_usage", {}).get("name", "unknown tool")
+                        complete_conversation.append(f"### 🛠️ Tool Used: {tool_name}")
+                        tool_args = msg.get("tool_usage", {}).get("args", {})
+                        if tool_args:
+                            complete_conversation.append("```json")
+                            complete_conversation.append(json.dumps(tool_args, indent=2))
+                            complete_conversation.append("```")
+                        
+                        tool_result = msg.get("tool_usage", {}).get("result", None)
+                        if tool_result:
+                            complete_conversation.append("### Tool Result")
+                            complete_conversation.append("```")
+                            complete_conversation.append(str(tool_result))
+                            complete_conversation.append("```")
             
-            # Create the ScoredDataGroup
+            # Add score information at the end
+            complete_conversation.append(f"\n## Score: {scored_data['score']:.4f}")
+            
+            # Join everything into a single string with double newlines between sections
+            full_conversation_markdown = "\n\n".join(complete_conversation)
+            
+            # Create the ScoredDataGroup with a single comprehensive markdown document
             scored_group = ScoredDataGroup(
                 tokens=[self.tokenizer.encode(json.dumps(messages))],
                 masks=[[1] * len(self.tokenizer.encode(json.dumps(messages)))],
                 scores=[scored_data["score"]],
-                messages=message_strings,  # Use string representation for HTML compatibility
+                messages=[full_conversation_markdown],  # Use single markdown document for HTML
                 _original_messages=[messages],  # Keep original for trainer API
             )
 
         else:
-            # Create token format
-            prefix = item.prompt
-            completion = scored_data["response"]
-
-            # Tokenize the prefix and completion
-            prefix_tokens = self.tokenizer.encode(prefix)
-            completion_tokens = self.tokenizer.encode(completion)
-
-            # Create full token sequence and masks
-            tokens = prefix_tokens + completion_tokens
-            masks = [0] * len(prefix_tokens) + [1] * len(completion_tokens)
-
+            # Create a proper conversation with role-based messages
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are an AI assistant solving a task with reasoning and problem-solving skills.",
+                },
+                {"role": "user", "content": item.prompt},
+                {"role": "assistant", "content": scored_data["response"]},
+            ]
+            
+            # Use the standard tokenize_for_trainer utility
+            
+            # Tokenize using the standard utility (only trains on assistant messages)
+            tokenized = tokenize_for_trainer(
+                self.tokenizer, 
+                messages,
+                train_on_all_assistant_turns=True  # Train on all assistant turns if present
+            )
+            
             # Create the ScoredDataGroup
             scored_group = ScoredDataGroup(
-                tokens=[tokens],
-                masks=[masks],
+                tokens=[tokenized["tokens"]],
+                masks=[tokenized["masks"]],
                 scores=[scored_data["score"]],
                 messages=None,
             )
@@ -847,27 +904,52 @@ class SmolagentsEnv(BaseEnv):
                     "content": f"I'm unable to solve this task. Error: {error_message}",
                 },
             ]
+            
+            # Create a comprehensive markdown document for the fallback case
+            complete_conversation = []
+            
+            # Add task information at the top
+            task_type = item.metadata.get("task", "Unknown task")
+            task_id = item.metadata.get("task_id", "Unknown ID")
+            complete_conversation.append(f"# GAIA Task: {task_type} (ID: {task_id})")
+            complete_conversation.append("## SYSTEM")
+            complete_conversation.append("You are an AI assistant solving tasks.")
+            complete_conversation.append("## USER")
+            complete_conversation.append(item.prompt)
+            complete_conversation.append("## ASSISTANT")
+            complete_conversation.append(f"I'm unable to solve this task. Error: {error_message}")
+            complete_conversation.append("## Score: 0.1 (Error fallback)")
+            
+            # Join everything into a single string with double newlines between sections
+            full_conversation_markdown = "\n\n".join(complete_conversation)
 
             scored_group = ScoredDataGroup(
                 tokens=[self.tokenizer.encode(json.dumps(messages))],
                 masks=[[1] * len(self.tokenizer.encode(json.dumps(messages)))],
                 scores=[0.1],  # Low score but not zero to allow some learning
-                messages=[messages],
+                messages=[full_conversation_markdown],  # Use string for HTML display
+                _original_messages=[messages],  # Keep original for trainer API
             )
         else:
-            # Token format fallback
-            prefix = item.prompt
-            completion = f"I'm unable to solve this task. Error: {error_message}"
-
-            prefix_tokens = self.tokenizer.encode(prefix)
-            completion_tokens = self.tokenizer.encode(completion)
-
-            tokens = prefix_tokens + completion_tokens
-            masks = [0] * len(prefix_tokens) + [1] * len(completion_tokens)
+            # Create a proper conversation with role-based messages for fallback
+            messages = [
+                {"role": "system", "content": "You are an AI assistant solving tasks."},
+                {"role": "user", "content": item.prompt},
+                {"role": "assistant", "content": f"I'm unable to solve this task. Error: {error_message}"},
+            ]
+            
+            # Use the standard tokenize_for_trainer utility
+            
+            # Tokenize using the standard utility (only trains on assistant messages)
+            tokenized = tokenize_for_trainer(
+                self.tokenizer, 
+                messages,
+                train_on_all_assistant_turns=True
+            )
 
             scored_group = ScoredDataGroup(
-                tokens=[tokens],
-                masks=[masks],
+                tokens=[tokenized["tokens"]],
+                masks=[tokenized["masks"]],
                 scores=[0.1],  # Low score but not zero
                 messages=None,
             )
