@@ -21,7 +21,8 @@ from smolagents.tools import tool  # Import the tool decorator
 
 import wandb
 from atroposlib.envs.base import BaseEnv, BaseEnvConfig, ScoredDataGroup
-from atroposlib.envs.server_handling.openai_server import OpenaiConfig, OpenAIServer
+from atroposlib.envs.server_handling.openai_server import OpenAIServer
+from atroposlib.envs.server_handling.server_baseline import APIServerConfig
 from atroposlib.envs.server_handling.server_manager import ServerManager
 from environments.smolagents_integration.agent_process_runner import run_agent_process
 from environments.smolagents_integration.server_proxy import ServerProxyManager
@@ -113,7 +114,7 @@ class SmolagentsEnv(BaseEnv):
     env_config_cls = SmolagentsEnvConfig
 
     @classmethod
-    def config_init(cls) -> Tuple[BaseEnvConfig, List[OpenaiConfig]]:
+    def config_init(cls) -> Tuple[BaseEnvConfig, List[APIServerConfig]]:
         """Initialize the config for CLI use."""
         env_config = SmolagentsEnvConfig(
             tokenizer_name="NousResearch/DeepHermes-3-Llama-3-8B-Preview",
@@ -138,7 +139,7 @@ class SmolagentsEnv(BaseEnv):
             # Using default timestamped output path from the config definition
         )
         server_configs = [
-            OpenaiConfig(
+            APIServerConfig(
                 model_name="NousResearch/DeepHermes-3-Llama-3-8B-Preview",
                 base_url="http://localhost:9001/v1",
                 api_key="x",
@@ -150,7 +151,7 @@ class SmolagentsEnv(BaseEnv):
     def __init__(
         self,
         config: SmolagentsEnvConfig,
-        server_configs: Union[List[OpenaiConfig], OpenaiConfig],
+        server_configs: Union[List[APIServerConfig], APIServerConfig],
         slurm=False,
         testing=False,
     ):
@@ -673,7 +674,7 @@ class SmolagentsEnv(BaseEnv):
             
             # Apply length penalty if configured
             length_penalty = 0.0
-            if self.config.length_penalty_weight > 0 and agent_response:
+            if self.config.length_penalty_weight > 0 and agent_response and isinstance(agent_response, str):
                 response_length = len(agent_response)
                 # Penalize very long responses
                 if response_length > 2000:
@@ -682,6 +683,10 @@ class SmolagentsEnv(BaseEnv):
                         self.config.length_penalty_weight * (response_length - 2000) / 1000,
                     )
                     combined_score = max(0.0, combined_score - length_penalty)
+            elif not isinstance(agent_response, str):
+                # Log the issue but don't fail
+                logger.warning(f"agent_response is not a string, it's a {type(agent_response)}: {agent_response}")
+                # Skip length penalty for non-string responses
             
             # Debug logging for score calculation
             if self.debug_scoring:
@@ -778,12 +783,31 @@ class SmolagentsEnv(BaseEnv):
                     {"role": "assistant", "content": scored_data["response"]}
                 )
 
+            # Convert complex message objects to strings for HTML compatibility
+            message_strings = []
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                
+                # Handle different content formats
+                if isinstance(content, list):
+                    content_text = []
+                    for item in content:
+                        if isinstance(item, dict) and 'text' in item:
+                            content_text.append(item['text'])
+                        else:
+                            content_text.append(str(item))
+                    content = '\n'.join(content_text)
+                
+                message_strings.append(f"**{role}**: {content}")
+            
             # Create the ScoredDataGroup
             scored_group = ScoredDataGroup(
                 tokens=[self.tokenizer.encode(json.dumps(messages))],
                 masks=[[1] * len(self.tokenizer.encode(json.dumps(messages)))],
                 scores=[scored_data["score"]],
-                messages=[messages],
+                messages=message_strings,  # Use string representation for HTML compatibility
+                _original_messages=[messages],  # Keep original for trainer API
             )
 
         else:

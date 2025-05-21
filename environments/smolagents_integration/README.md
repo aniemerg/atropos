@@ -70,32 +70,60 @@ atropos-sft-gen output.jsonl --tokenizer NousResearch/DeepHermes-3-Llama-3-8B-Pr
   --save-messages --env smolagents
 ```
 
-For local testing without connecting to the API server:
+For local testing using OpenAI API directly:
+
+```bash
+# Minimal test (processes just 2 examples)
+python -m environments.smolagents_integration.smolagents_env process \
+  --env.data_path_to_save_groups output/gaia/smolagents_output.jsonl \
+  --env.total_steps 1 \
+  --env.group_size 2 \
+  --env.include_messages true \
+  --env.max_concurrent_processes 8 \
+  --env.use_chat_completion true \
+  --openai.model_name "gpt-4o" \
+  --openai.base_url "https://api.openai.com/v1"
+```
+
+```bash
+# Standard run (processes 10 groups of 2 examples each = 20 total examples)
+python -m environments.smolagents_integration.smolagents_env process \
+  --env.data_path_to_save_groups output/gaia/smolagents_output.jsonl \
+  --env.total_steps 10 \
+  --env.group_size 2 \
+  --env.include_messages true \
+  --env.max_concurrent_processes 8 \
+  --env.use_chat_completion true \
+  --openai.model_name "gpt-4o" \
+  --openai.base_url "https://api.openai.com/v1"
+```
+
+Note: The command syntax uses dots (`.`) to separate namespaces. Also, the OpenAI API key should be set in your environment variables as `OPENAI_API_KEY` or in a `.env` file in the project root.
+
+If you want to use a local server instead of OpenAI:
 
 ```bash
 python -m environments.smolagents_integration.smolagents_env process \
-  --env_data_path_to_save_groups output.jsonl \
-  --env_total_steps 10 \
-  --env_group_size 2 \
-  --env_include_messages true \
-  --env_max_concurrent_agents 4 \
-  --env_use_chat_completion true \
-  --openai_model_name "gpt-4o" \
-  --openai_base_url "https://api.openai.com/v1" \
-  --openai_api_key "$OPENAI_API_KEY"
+  --env.data_path_to_save_groups output/gaia/smolagents_output.jsonl \
+  --env.total_steps 10 \
+  --env.group_size 2 \
+  --env.include_messages true \
+  --env.max_concurrent_processes 8 \
+  --env.use_chat_completion true \
+  --openai.model_name "your-model-name" \
+  --openai.base_url "http://localhost:8000/v1"
 ```
 
 To serve the environment for a trainer:
 
 ```bash
 python -m environments.smolagents_integration.smolagents_env serve \
-  --env_rollout_server_url "http://localhost:8000" \
-  --env_use_chat_completion true \
-  --env_max_concurrent_agents 5 \
-  --env_group_size 8 \
-  --openai_model_name "gpt-4o" \
-  --openai_base_url "https://api.openai.com/v1" \
-  --openai_api_key "$OPENAI_API_KEY"
+  --env.rollout_server_url "http://localhost:8000" \
+  --env.use_chat_completion true \
+  --env.max_concurrent_processes 5 \
+  --env.group_size 8 \
+  --openai.model_name "gpt-4o" \
+  --openai.base_url "https://api.openai.com/v1"
 ```
 
 ### Running a Single GAIA Task
